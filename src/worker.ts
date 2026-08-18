@@ -67,6 +67,7 @@ interface PendingUpload {
 export class ChannelQueue extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
     if (url.pathname === "/enqueue" && request.method === "POST") {
       const upload = await request.json<PendingUpload>();
       const paddedTs = String(upload.uploadedAt).padStart(15, "0");
@@ -79,6 +80,29 @@ export class ChannelQueue extends DurableObject<Env> {
       }
       return new Response("queued", { status: 202 });
     }
+
+    // Claim ownership of this channel for a login. First caller wins;
+    // subsequent callers with the same login are allowed through; any
+    // other login gets a 403. Called by handleUploadInit before enqueuing.
+    if (url.pathname === "/claim" && request.method === "POST") {
+      const { login } = await request.json<{ login: string }>();
+      const existing = await this.ctx.storage.get<string>("owner");
+      if (!existing) {
+        await this.ctx.storage.put("owner", login);
+        return Response.json({ owner: login, claimed: true });
+      }
+      if (existing === login) {
+        return Response.json({ owner: existing, claimed: false });
+      }
+      return Response.json({ owner: existing, claimed: false }, { status: 403 });
+    }
+
+    // Return current owner (or null if unclaimed).
+    if (url.pathname === "/owner" && request.method === "GET") {
+      const owner = await this.ctx.storage.get<string>("owner") ?? null;
+      return Response.json({ owner });
+    }
+
     return new Response("not found", { status: 404 });
   }
 
@@ -167,8 +191,12 @@ export default {
       return handleDeletePackage(request, pkgMatch[1], pkgMatch[2], pkgMatch[3], env);
     }
 
+    // GET /channel/<channel>/owner — return the owner of a channel
     // DELETE /channel/<channel> — wipe entire channel (for test cleanup)
     const chanMatch = url.pathname.match(/^\/channel\/([^/]+)$/);
+    if (chanMatch && request.method === "GET") {
+      return handleGetOwner(chanMatch[1], env);
+    }
     if (chanMatch && request.method === "DELETE") {
       return handleDeleteChannel(request, chanMatch[1], env);
     }
@@ -176,6 +204,41 @@ export default {
     return new Response("not found", { status: 404 });
   },
 };
+
+// ---------------------------------------------------------------------------
+// Channel ownership — backed by ChannelQueue's DO storage.
+//
+// checkChannelAccess: claim the channel on first write (first caller wins),
+// or verify the caller is the existing owner. Returns a 403 Response if
+// access is denied, or null if access is granted.
+//
+// handleGetOwner: public read of who owns a channel.
+// ---------------------------------------------------------------------------
+async function checkChannelAccess(channel: string, login: string, env: Env): Promise<Response | null> {
+  const queueId = env.QUEUE.idFromName(channel);
+  const queue = env.QUEUE.get(queueId);
+  const resp = await queue.fetch("http://queue/claim", {
+    method: "POST",
+    body: JSON.stringify({ login }),
+    headers: { "content-type": "application/json" },
+  });
+  if (resp.status === 403) {
+    const { owner } = await resp.json<{ owner: string }>();
+    return new Response(
+      `channel '${channel}' is owned by ${owner} — access denied`,
+      { status: 403 }
+    );
+  }
+  return null; // access granted
+}
+
+async function handleGetOwner(channel: string, env: Env): Promise<Response> {
+  if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
+  const queueId = env.QUEUE.idFromName(channel);
+  const queue = env.QUEUE.get(queueId);
+  const resp = await queue.fetch("http://queue/owner");
+  return resp;
+}
 
 // ---------------------------------------------------------------------------
 // Read path — serve any object under <channel>/<subdir>/ from R2.
@@ -206,6 +269,9 @@ async function handleDeletePackage(request: Request, channel: string, subdir: st
 
   const invalid = validateChannelAndFilename(channel, filename);
   if (invalid) return new Response(invalid, { status: 400 });
+
+  const denied = await checkChannelAccess(channel, claims.login, env);
+  if (denied) return denied;
 
   const key = `${channel}/${subdir}/${filename}`;
   const exists = await env.CHANNEL_BUCKET.head(key);
@@ -242,6 +308,9 @@ async function handleDeleteChannel(request: Request, channel: string, env: Env):
   if (!claims) return new Response("unauthorized", { status: 401 });
 
   if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
+
+  const denied = await checkChannelAccess(channel, claims.login, env);
+  if (denied) return denied;
 
   let deleted = 0;
   let cursor: string | undefined;
@@ -297,6 +366,10 @@ async function handleUploadInit(request: Request, env: Env): Promise<Response> {
   const { channel, filename } = await request.json<{ channel: string; filename: string }>();
   const invalid = validateChannelAndFilename(channel, filename);
   if (invalid) return new Response(invalid, { status: 400 });
+
+  // Claim or verify ownership before issuing a presigned URL.
+  const denied = await checkChannelAccess(channel, claims.login, env);
+  if (denied) return denied;
 
   const key = stagingKeyFor(channel, filename);
   const objectUrl = new URL(
