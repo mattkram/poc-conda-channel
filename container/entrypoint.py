@@ -327,7 +327,8 @@ def _upload_repodata(subdir_path: str, prefix: str) -> None:
     #   index.html                        — human-browsable listing
     #   repodata_from_packages.json       — raw pre-patch repodata
     #   repodata_shards_from_packages.*   — raw pre-patch shard source
-    UPLOAD_NAMES = {"repodata.json", "repodata_shards.msgpack.zst", "patch_instructions.json"}
+    UPLOAD_NAMES = {"repodata.json", "repodata_shards.msgpack.zst",
+                    "patch_instructions.json", "index.html"}
     for fname in os.listdir(subdir_path):
         if fname in UPLOAD_NAMES:
             s3.upload_file(os.path.join(subdir_path, fname), BUCKET, f"{prefix}{fname}")

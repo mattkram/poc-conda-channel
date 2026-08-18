@@ -217,6 +217,21 @@ export default {
       return handleR2Get(request, readMatch[1], url.pathname.slice(1), env);
     }
 
+    // GET /<channel>/<subdir>  or  GET /<channel>/<subdir>/  — subdir index
+    const subdirMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/?$/);
+    if (subdirMatch && request.method === "GET") {
+      return handleR2Get(request, subdirMatch[1], `${subdirMatch[1]}/${subdirMatch[2]}/index.html`, env);
+    }
+
+    // GET /<channel>  or  GET /<channel>/  — channel root listing
+    const channelRootMatch = url.pathname.match(/^\/([^/]+)\/?$/);
+    if (channelRootMatch && request.method === "GET"
+        && !url.pathname.startsWith("/channel/")
+        && !url.pathname.startsWith("/auth/")
+        && !url.pathname.startsWith("/upload/")) {
+      return handleChannelRoot(request, channelRootMatch[1], env);
+    }
+
     // DELETE /channel/<channel>/<subdir>/<filename> — remove one package + reindex
     const pkgMatch = url.pathname.match(/^\/channel\/([^/]+)\/([^/]+)\/([^/]+)$/);
     if (pkgMatch && request.method === "DELETE") {
@@ -331,6 +346,49 @@ async function handleR2Get(request: Request, channel: string, key: string, env: 
   obj.writeHttpMetadata(headers);
   headers.set("etag", obj.httpEtag);
   return new Response(obj.body, { headers });
+}
+
+// ---------------------------------------------------------------------------
+// Channel root listing — GET /<channel>/ — returns an HTML page listing
+// the subdirs present in the channel (discovered by listing R2 prefixes).
+// ---------------------------------------------------------------------------
+async function handleChannelRoot(request: Request, channel: string, env: Env): Promise<Response> {
+  if (!CHANNEL_NAME_RE.test(channel)) return new Response("not found", { status: 404 });
+
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const claims = token ? await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET) : null;
+  const denied = await checkReadAccess(channel, claims?.login ?? null, env);
+  if (denied) return denied;
+
+  // Discover subdirs by listing objects and collecting unique top-level prefixes.
+  const subdirs = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const list = await env.CHANNEL_BUCKET.list({ prefix: `${channel}/`, cursor, delimiter: "/" });
+    for (const prefix of (list as any).delimitedPrefixes ?? []) {
+      const subdir = prefix.slice(channel.length + 1, -1); // strip "channel/" and trailing "/"
+      if (subdir && !subdir.startsWith("_")) subdirs.add(subdir);
+    }
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+
+  const rows = [...subdirs].sort().map(
+    (s) => `<li><a href="/${channel}/${s}/">${s}/</a></li>`
+  ).join("\n    ");
+
+  const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>${channel}</title></head>
+<body>
+<h1>${channel}</h1>
+<ul>
+    ${rows || "<li><em>(empty)</em></li>"}
+</ul>
+</body>
+</html>`;
+
+  return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
 // ---------------------------------------------------------------------------
