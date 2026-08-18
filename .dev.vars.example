@@ -1,0 +1,10 @@
+# Copy this file to .dev.vars (gitignored) and fill in real values for
+# `wrangler dev`. In production these are set with `wrangler secret put`
+# instead — never commit real values here or in wrangler.toml.
+
+GITHUB_CLIENT_ID=
+GITHUB_ORG=
+UPLOAD_TOKEN_SECRET=
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=
+R2_ACCOUNT_ID=

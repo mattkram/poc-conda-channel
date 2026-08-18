@@ -1,0 +1,54 @@
+name = "conda-channel-server"
+main = "src/worker.ts"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# --- R2 bucket holding the actual channel (noarch/, linux-64/, repodata.json, packages) ---
+[[r2_buckets]]
+binding = "CHANNEL_BUCKET"
+bucket_name = "conda-channel"
+
+# --- Plaintext vars (fine to commit — not sensitive) ---
+[vars]
+R2_BUCKET_NAME = "conda-channel"
+
+# --- Secrets (set via `wrangler secret put`) ---
+# GITHUB_CLIENT_ID        - GitHub OAuth App client id (device flow)
+# GITHUB_ORG              - org name required for membership check
+# UPLOAD_TOKEN_SECRET     - HMAC secret used to sign short-lived upload JWTs
+# R2_ACCESS_KEY_ID        - R2 S3-compatible API token. Worker uses it only
+# R2_SECRET_ACCESS_KEY      to sign presigned URLs; also forwarded into the
+# R2_ACCOUNT_ID             container's env via envVars (see IndexerContainer
+#                           in src/worker.ts) since that's what actually
+#                           talks to R2 with boto3.
+
+# --- Durable Object bindings ---
+# INDEXER: the actual container process (unchanged — see IndexerContainer)
+# QUEUE:   plain DO, no container, just storage + alarm. One per channel.
+#          Debounces uploads into a batch and guarantees only one
+#          conda-index run per channel is ever in flight at a time.
+[durable_objects]
+bindings = [
+  { name = "INDEXER", class_name = "IndexerContainer" },
+  { name = "QUEUE", class_name = "ChannelQueue" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["IndexerContainer"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ChannelQueue"]
+
+# --- Container definition (built from container/Dockerfile) ---
+[[containers]]
+class_name = "IndexerContainer"
+image = "./container/Dockerfile"
+max_instances = 3        # cap concurrent indexer runs
+instance_type = "standard-1"  # valid values: lite | basic | standard-1..4 (default lite)
+                              # conda-index is memory-hungry more than CPU-hungry; bump
+                              # to standard-2/3 if you see OOM on large subdirs
