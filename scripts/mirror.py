@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Mirror a subset of repo.anaconda.com/pkgs/main noarch packages to our channel.
+Mirror a random subset of repo.anaconda.com/pkgs/main noarch packages to our channel.
 
-Fetches repodata from the source, picks the N smallest packages (latest
-version per name only), downloads each one, uploads it to our Worker, then
-waits for repodata to reflect all of them.
+Fetches repodata from both source and destination, picks N random packages
+that aren't already in the destination, uploads them, then waits for repodata
+to reflect all of them.
 
 Usage:
   python scripts/mirror.py --channel main --count 100
@@ -17,10 +17,13 @@ Performance flags:
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
+import random
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -32,27 +35,37 @@ SOURCE_BASE     = "https://repo.anaconda.com/pkgs/main/noarch"
 POLL_TIMEOUT    = 300   # 5 min — more packages means longer indexing
 
 
-def fetch_repodata(url: str) -> dict:
-    print(f"Fetching repodata from {url} ...")
+def fetch_repodata(url: str, label: str) -> dict:
+    print(f"Fetching {label} repodata...")
     req = urllib.request.Request(url, headers={"user-agent": "conda-mirror/1.0"})
-    with urllib.request.urlopen(req) as resp:
-        import json
-        return json.load(resp)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {}
+        raise
 
 
-def pick_packages(repodata: dict, count: int) -> list[dict]:
+def all_filenames(repodata: dict) -> set[str]:
+    """Return every package filename present in a repodata dict."""
+    return (
+        set(repodata.get("packages", {}).keys()) |
+        set(repodata.get("packages.conda", {}).keys())
+    )
+
+
+def candidate_packages(repodata: dict) -> list[dict]:
     """
-    Return up to `count` packages: latest version per name, sorted by size
-    ascending, then trimmed to `count`. Prefers .conda over .tar.bz2.
+    Return one entry per unique package name — the latest version, preferring
+    .conda over .tar.bz2. Used to build the pool to sample from.
     """
     all_pkgs: dict[str, dict] = {}
-
-    # Merge both package dicts; .conda entries overwrite .tar.bz2 for same name+version
+    # Process .tar.bz2 first so .conda overwrites for same name+version
     for fmt in ("packages", "packages.conda"):
         for fname, meta in repodata.get(fmt, {}).items():
             all_pkgs[fname] = {**meta, "filename": fname}
 
-    # Keep only latest version per package name
     latest: dict[str, dict] = {}
     for meta in all_pkgs.values():
         name = meta.get("name", "")
@@ -60,13 +73,29 @@ def pick_packages(repodata: dict, count: int) -> list[dict]:
         if not existing:
             latest[name] = meta
         else:
-            # Compare version strings lexicographically (good enough for selection)
             if meta.get("version", "") > existing.get("version", ""):
                 latest[name] = meta
+    return list(latest.values())
 
-    # Sort by size ascending, take first `count`
-    selected = sorted(latest.values(), key=lambda m: m.get("size", 0))[:count]
-    return selected
+
+def pick_packages(source_repodata: dict, dest_repodata: dict, count: int, seed: int | None) -> list[dict]:
+    """
+    Pick `count` random packages from source that aren't already in dest.
+    Uses the destination's full filename set so we never re-upload something
+    that's already indexed (even under a different format).
+    """
+    already_have = all_filenames(dest_repodata)
+    candidates = [
+        m for m in candidate_packages(source_repodata)
+        if m["filename"] not in already_have
+    ]
+
+    if not candidates:
+        return []
+
+    rng = random.Random(seed)
+    rng.shuffle(candidates)
+    return candidates[:count]
 
 
 def download_package(meta: dict, dest_dir: pathlib.Path) -> pathlib.Path:
@@ -81,8 +110,13 @@ def download_package(meta: dict, dest_dir: pathlib.Path) -> pathlib.Path:
     return dest
 
 
-def upload_one(client: ChannelClient, channel: str, token: str,
-               meta: dict, dest_dir: pathlib.Path) -> tuple[str, float, str | None]:
+def upload_one(
+    client: ChannelClient,
+    channel: str,
+    token: str,
+    meta: dict,
+    dest_dir: pathlib.Path,
+) -> tuple[str, float, str | None]:
     """Download then upload one package. Returns (filename, elapsed_s, error|None)."""
     filename = meta["filename"]
     t0 = time.time()
@@ -95,7 +129,7 @@ def upload_one(client: ChannelClient, channel: str, token: str,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Mirror pkgs/main noarch packages to a channel")
+    parser = argparse.ArgumentParser(description="Mirror random pkgs/main noarch packages to a channel")
     parser.add_argument("--channel", "-c", default="main", help="Destination channel (default: main)")
     parser.add_argument("--count", "-n", type=int, default=100, help="Number of packages to mirror (default: 100)")
     parser.add_argument("--workers", "-w", type=int, default=4, help="Parallel upload threads (default: 4)")
@@ -103,6 +137,7 @@ def main() -> None:
     parser.add_argument("--reauth", action="store_true", help="Force re-authentication")
     parser.add_argument("--no-wait", action="store_true", help="Skip repodata polling after upload")
     parser.add_argument("--keep", action="store_true", help="Keep downloaded packages after upload")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible package selection")
     args = parser.parse_args()
 
     client = ChannelClient(worker_url=args.worker_url)
@@ -115,14 +150,27 @@ def main() -> None:
     except ChannelError as e:
         sys.exit(f"Auth failed: {e}")
 
-    # Fetch and select packages
-    repodata = fetch_repodata(SOURCE_REPODATA)
-    selected = pick_packages(repodata, args.count)
+    # Fetch source and destination repodata in parallel
+    source_repodata = fetch_repodata(SOURCE_REPODATA, "source (pkgs/main)")
+    dest_url = f"{args.worker_url.rstrip('/')}/{args.channel}/noarch/repodata.json"
+    dest_repodata = fetch_repodata(dest_url, f"destination ({args.channel})")
+
+    already = len(all_filenames(dest_repodata))
+    print(f"  Destination already has {already} package(s).\n")
+
+    # Select packages
+    selected = pick_packages(source_repodata, dest_repodata, args.count, args.seed)
+    if not selected:
+        print("Nothing new to upload — destination already contains all candidates.")
+        sys.exit(0)
+    if len(selected) < args.count:
+        print(f"Note: only {len(selected)} new packages available (requested {args.count}).")
+
     total_bytes = sum(m.get("size", 0) for m in selected)
     print(f"Selected {len(selected)} packages ({total_bytes / 1024 / 1024:.1f} MB total)")
-    print(f"Uploading to channel '{args.channel}' with {args.workers} parallel workers\n")
+    print(f"Uploading to '{args.channel}' with {args.workers} parallel workers\n")
 
-    # Upload with thread pool, downloading to a temp dir
+    # Upload with thread pool
     with tempfile.TemporaryDirectory() as tmpdir:
         dest_dir = pathlib.Path(tmpdir)
         t_start = time.time()
@@ -149,21 +197,16 @@ def main() -> None:
 
         wall = time.time() - t_start
         ok_count = len(selected) - errors
-        ok_bytes = sum(
-            futures[f].get("size", 0)
-            for f, meta in futures.items()
-            # re-match by result — just sum all selected sizes minus errored
-        )
-        # simpler: sum sizes of non-errored packages
         errored_names = {r[0] for r in results if r[2]}
         ok_bytes = sum(m.get("size", 0) for m in selected if m["filename"] not in errored_names)
 
         print(f"\n{'='*60}")
         print(f"Uploaded {ok_count}/{len(selected)} packages in {wall:.1f}s")
-        print(f"Throughput: {ok_bytes / 1024 / 1024 / wall:.2f} MB/s  "
-              f"({ok_count / wall:.1f} pkgs/s)")
+        if wall > 0:
+            print(f"Throughput: {ok_bytes / 1024 / 1024 / wall:.2f} MB/s  "
+                  f"({ok_count / wall:.1f} pkgs/s)")
         if errors:
-            print(f"Errors: {errors}")
+            print(f"Errors ({errors}):")
             for fname, _, err in results:
                 if err:
                     print(f"  {fname}: {err}")

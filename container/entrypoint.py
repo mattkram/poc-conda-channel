@@ -152,13 +152,33 @@ def ingest_batch(channel: str, files: list[dict]) -> dict[str, str]:
 PACKAGE_EXTENSIONS = (".conda", ".tar.bz2")
 
 
+def _cached_filenames(subdir_path: str) -> set[str]:
+    """Return the set of package filenames already in conda-index's sqlite cache.
+    These don't need to be downloaded — conda-index will use cached metadata
+    and never open the package files themselves."""
+    import sqlite3
+    db_path = os.path.join(subdir_path, ".cache", "cache.db")
+    if not os.path.exists(db_path):
+        return set()
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("SELECT path FROM index_json").fetchall()
+        conn.close()
+        return {row[0] for row in rows}
+    except Exception:
+        return set()
+
+
 def _download_subdir(prefix: str, subdir_path: str, skip: set[str] | None = None) -> None:
-    """Download every existing *package* under prefix except those in `skip`
-    (already on disk locally from this batch). Positive extension filter
-    rather than blocklisting — otherwise this would also re-download
-    repodata.json, the shard index, and every shard file on every single
-    run, none of which are inputs to conda-index, only its own outputs."""
-    skip = skip or set()
+    """Download existing packages that conda-index actually needs on disk.
+
+    Packages already in the local cache.db are skipped — conda-index reads
+    their metadata from sqlite and never opens the package file, so downloading
+    them would be pure waste. Only packages not yet cached (truly new to this
+    channel) need to be present on disk for conda-index to extract their metadata.
+
+    `skip` is the set of filenames already staged locally from this batch."""
+    skip = (skip or set()) | _cached_filenames(subdir_path)
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
