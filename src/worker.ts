@@ -97,10 +97,43 @@ export class ChannelQueue extends DurableObject<Env> {
       return Response.json({ owner: existing, claimed: false }, { status: 403 });
     }
 
-    // Return current owner (or null if unclaimed).
+    // Return current owner and visibility (or null/public if unclaimed).
     if (url.pathname === "/owner" && request.method === "GET") {
       const owner = await this.ctx.storage.get<string>("owner") ?? null;
-      return Response.json({ owner });
+      const visibility = await this.ctx.storage.get<string>("visibility") ?? "public";
+      return Response.json({ owner, visibility });
+    }
+
+    // Set visibility — only the owner may call this.
+    if (url.pathname === "/set-visibility" && request.method === "POST") {
+      const { login, visibility } = await request.json<{ login: string; visibility: string }>();
+      if (visibility !== "public" && visibility !== "private") {
+        return new Response("visibility must be 'public' or 'private'", { status: 400 });
+      }
+      const owner = await this.ctx.storage.get<string>("owner");
+      if (!owner) {
+        return new Response("channel has no owner yet", { status: 409 });
+      }
+      if (owner !== login) {
+        return new Response("only the channel owner can change visibility", { status: 403 });
+      }
+      await this.ctx.storage.put("visibility", visibility);
+      return Response.json({ owner, visibility });
+    }
+
+    // Check read access — returns {allowed: true} or 401/403.
+    // Called by the Worker's read path for private channels.
+    if (url.pathname === "/check-read" && request.method === "POST") {
+      const { login } = await request.json<{ login: string | null }>();
+      const visibility = await this.ctx.storage.get<string>("visibility") ?? "public";
+      if (visibility === "public") {
+        return Response.json({ allowed: true });
+      }
+      const owner = await this.ctx.storage.get<string>("owner") ?? null;
+      if (login && login === owner) {
+        return Response.json({ allowed: true });
+      }
+      return Response.json({ allowed: false, owner }, { status: 403 });
     }
 
     return new Response("not found", { status: 404 });
@@ -177,12 +210,11 @@ export default {
       return handleUploadComplete(request, env);
     }
 
-    // GET /<channel>/<subdir>/<path> — public read path for conda clients.
-    // Serves repodata.json, repodata_shards.msgpack.zst, shards/*.msgpack.zst,
-    // and package files directly from R2. No auth required.
+    // GET /<channel>/<subdir>/<path> — read path for conda clients.
+    // Public channels: no auth. Private channels: Bearer token required.
     const readMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/.+$/);
     if (readMatch && request.method === "GET") {
-      return handleR2Get(url.pathname.slice(1), env);
+      return handleR2Get(request, readMatch[1], url.pathname.slice(1), env);
     }
 
     // DELETE /channel/<channel>/<subdir>/<filename> — remove one package + reindex
@@ -191,14 +223,19 @@ export default {
       return handleDeletePackage(request, pkgMatch[1], pkgMatch[2], pkgMatch[3], env);
     }
 
-    // GET /channel/<channel>/owner — return the owner of a channel
-    // DELETE /channel/<channel> — wipe entire channel (for test cleanup)
+    // GET  /channel/<channel>         — return owner + visibility
+    // POST /channel/<channel>/visibility — set public/private (owner only)
+    // DELETE /channel/<channel>       — wipe entire channel
     const chanMatch = url.pathname.match(/^\/channel\/([^/]+)$/);
     if (chanMatch && request.method === "GET") {
-      return handleGetOwner(chanMatch[1], env);
+      return handleGetChannelInfo(chanMatch[1], env);
     }
     if (chanMatch && request.method === "DELETE") {
       return handleDeleteChannel(request, chanMatch[1], env);
+    }
+    const visMatch = url.pathname.match(/^\/channel\/([^/]+)\/visibility$/);
+    if (visMatch && request.method === "POST") {
+      return handleSetVisibility(request, visMatch[1], env);
     }
 
     return new Response("not found", { status: 404 });
@@ -206,14 +243,10 @@ export default {
 };
 
 // ---------------------------------------------------------------------------
-// Channel ownership — backed by ChannelQueue's DO storage.
-//
-// checkChannelAccess: claim the channel on first write (first caller wins),
-// or verify the caller is the existing owner. Returns a 403 Response if
-// access is denied, or null if access is granted.
-//
-// handleGetOwner: public read of who owns a channel.
+// Channel metadata — owner + visibility, backed by ChannelQueue DO storage.
 // ---------------------------------------------------------------------------
+
+// Claim-or-verify write access. Returns a 403 Response on denial, null on ok.
 async function checkChannelAccess(channel: string, login: string, env: Env): Promise<Response | null> {
   const queueId = env.QUEUE.idFromName(channel);
   const queue = env.QUEUE.get(queueId);
@@ -229,23 +262,69 @@ async function checkChannelAccess(channel: string, login: string, env: Env): Pro
       { status: 403 }
     );
   }
-  return null; // access granted
+  return null;
 }
 
-async function handleGetOwner(channel: string, env: Env): Promise<Response> {
+// Check read access for a channel. Returns 401/403 Response on denial, null on ok.
+// login may be null for unauthenticated requests to public channels.
+async function checkReadAccess(channel: string, login: string | null, env: Env): Promise<Response | null> {
+  const queueId = env.QUEUE.idFromName(channel);
+  const queue = env.QUEUE.get(queueId);
+  const resp = await queue.fetch("http://queue/check-read", {
+    method: "POST",
+    body: JSON.stringify({ login }),
+    headers: { "content-type": "application/json" },
+  });
+  if (resp.status === 403) {
+    return new Response(
+      `channel '${channel}' is private — provide a valid Bearer token`,
+      { status: 401, headers: { "WWW-Authenticate": 'Bearer realm="conda-channel"' } }
+    );
+  }
+  return null;
+}
+
+// GET /channel/<channel> — returns { owner, visibility }
+async function handleGetChannelInfo(channel: string, env: Env): Promise<Response> {
   if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
   const queueId = env.QUEUE.idFromName(channel);
   const queue = env.QUEUE.get(queueId);
-  const resp = await queue.fetch("http://queue/owner");
+  return queue.fetch("http://queue/owner");
+}
+
+// POST /channel/<channel>/visibility — set public or private (owner only)
+async function handleSetVisibility(request: Request, channel: string, env: Env): Promise<Response> {
+  if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
+
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
+  if (!claims) return new Response("unauthorized", { status: 401 });
+
+  const body = await request.json<{ visibility: string }>();
+  const queueId = env.QUEUE.idFromName(channel);
+  const queue = env.QUEUE.get(queueId);
+  const resp = await queue.fetch("http://queue/set-visibility", {
+    method: "POST",
+    body: JSON.stringify({ login: claims.login, visibility: body.visibility }),
+    headers: { "content-type": "application/json" },
+  });
   return resp;
 }
 
 // ---------------------------------------------------------------------------
 // Read path — serve any object under <channel>/<subdir>/ from R2.
-// Covers repodata.json, repodata_shards.msgpack.zst, shards/*.msgpack.zst,
-// and package files. No auth — public read path for conda clients.
+// Public channels: no auth. Private channels: Bearer token required.
 // ---------------------------------------------------------------------------
-async function handleR2Get(key: string, env: Env): Promise<Response> {
+async function handleR2Get(request: Request, channel: string, key: string, env: Env): Promise<Response> {
+  // Extract login from Bearer token if present (may be absent for public channels).
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const claims = token ? await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET) : null;
+
+  const denied = await checkReadAccess(channel, claims?.login ?? null, env);
+  if (denied) return denied;
+
   const obj = await env.CHANNEL_BUCKET.get(key);
   if (!obj) return new Response("not found", { status: 404 });
   const headers = new Headers();

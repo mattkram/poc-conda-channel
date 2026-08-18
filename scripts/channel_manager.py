@@ -107,6 +107,15 @@ def _make_parser() -> argparse.ArgumentParser:
         help="Optional glob pattern to filter package names (e.g. 'ca-cert*')",
     )
 
+    # info
+    p_info = sub.add_parser("info", help="Show channel owner and visibility")
+    p_info.add_argument("--channel", "-c", required=True, help="Channel name")
+
+    # visibility
+    p_vis = sub.add_parser("visibility", help="Set a channel public or private (owner only)")
+    p_vis.add_argument("--channel", "-c", required=True, help="Channel name")
+    p_vis.add_argument("setting", choices=["public", "private"], help="New visibility")
+
     return parser
 
 
@@ -220,6 +229,27 @@ def cmd_search(args, client: ChannelClient) -> None:
         print(f"{fname:<{col_w}}  {meta.get('version', ''):<20}  {meta.get('build', '')}")
 
 
+def cmd_info(args, client: ChannelClient) -> None:
+    try:
+        info = client.get_channel_info(args.channel)
+    except ChannelError as e:
+        sys.exit(f"ERROR: {e}")
+    owner = info.get("owner") or "(unclaimed)"
+    visibility = info.get("visibility", "public")
+    print(f"Channel:    {args.channel}")
+    print(f"Owner:      {owner}")
+    print(f"Visibility: {visibility}")
+
+
+def cmd_visibility(args, client: ChannelClient) -> None:
+    token = client.login(force=args.reauth)
+    try:
+        result = client.set_visibility(args.channel, args.setting, token)
+        print(f"Channel '{args.channel}' is now {result['visibility']}.")
+    except ChannelError as e:
+        sys.exit(f"ERROR: {e}")
+
+
 COMMANDS = {
     "login": cmd_login,
     "logout": cmd_logout,
@@ -227,6 +257,8 @@ COMMANDS = {
     "delete": cmd_delete,
     "purge": cmd_purge,
     "search": cmd_search,
+    "info": cmd_info,
+    "visibility": cmd_visibility,
 }
 
 

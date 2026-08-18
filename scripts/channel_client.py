@@ -284,7 +284,26 @@ class ChannelClient:
             print()  # clear the \r line
         return len(remaining) == 0
 
-    def get_repodata(self, channel: str, subdir: str) -> dict:
+    def get_channel_info(self, channel: str) -> dict:
+        """Return {owner, visibility} for a channel."""
+        status, data = _api("GET", f"{self.worker_url}/channel/{channel}")
+        if status != 200:
+            raise ChannelError(f"could not get channel info ({status}): {data}")
+        return data
+
+    def set_visibility(self, channel: str, visibility: str, token: str) -> dict:
+        """Set a channel's visibility to 'public' or 'private'. Owner only."""
+        if visibility not in ("public", "private"):
+            raise ChannelError("visibility must be 'public' or 'private'")
+        status, data = _api(
+            "POST",
+            f"{self.worker_url}/channel/{channel}/visibility",
+            {"visibility": visibility},
+            token=token,
+        )
+        if status != 200:
+            raise ChannelError(f"set-visibility failed ({status}): {data}")
+        return data
         """Fetch and return repodata.json for a channel/subdir."""
         url = f"{self.worker_url}/{channel}/{subdir}/repodata.json"
         status, data = _get_json(url)
