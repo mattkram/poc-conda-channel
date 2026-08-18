@@ -40,7 +40,9 @@ Tiny HTTP server that IS the container's whole job:
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import boto3
@@ -51,6 +53,54 @@ R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
 R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
 R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
 BUCKET = os.environ.get("R2_BUCKET_NAME", "conda-channel")
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    region_name="auto",
+)
+
+
+# ---------------------------------------------------------------------------
+# Structured logging — emits one JSON object per line to stdout.
+# Cloudflare Containers captures stdout into Workers Logs.
+# ---------------------------------------------------------------------------
+
+def _mem_mb() -> float:
+    """Resident set size in MB from /proc/self/status (Linux only)."""
+    try:
+        for line in open("/proc/self/status").readlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
+
+
+def _cpu_times() -> tuple[float, float]:
+    """(user_s, system_s) from /proc/self/stat."""
+    try:
+        fields = open("/proc/self/stat").read().split()
+        clk = os.sysconf("SC_CLK_TCK")
+        return int(fields[13]) / clk, int(fields[14]) / clk
+    except Exception:
+        return 0.0, 0.0
+
+
+def log(event: str, **kwargs) -> None:
+    """Emit a structured log line to stdout."""
+    cpu_u, cpu_s = _cpu_times()
+    record = {
+        "ts": time.time(),
+        "event": event,
+        "mem_mb": round(_mem_mb(), 1),
+        "cpu_user_s": round(cpu_u, 2),
+        "cpu_sys_s": round(cpu_s, 2),
+        **kwargs,
+    }
+    print(json.dumps(record), flush=True)
 
 s3 = boto3.client(
     "s3",
@@ -84,27 +134,29 @@ def read_index_json(conda_path: str) -> dict:
 
 def ingest_batch(channel: str, files: list[dict]) -> dict[str, str]:
     results: dict[str, str] = {}
+    t_batch = time.time()
+    log("ingest_batch.start", channel=channel, n_files=len(files))
 
     with tempfile.TemporaryDirectory() as tmp:
         channel_root = os.path.join(tmp, "channel")
         by_subdir: dict[str, list[str]] = {}
 
         # Phase 1: stage every file locally and figure out where it belongs.
-        # Failures here are per-file and don't block the rest of the batch.
         for f in files:
             filename = f["filename"]
             staging_key = f"{channel}/_incoming/{filename}"
 
             if not _object_exists(staging_key):
-                # Already fully ingested by a previous run of this same
-                # batch (e.g. one subdir succeeded, another failed, and
-                # this file's queue entry got retried) — nothing to do.
                 results[filename] = "ok"
                 continue
 
             try:
                 staged_path = os.path.join(tmp, filename)
+                t0 = time.time()
                 s3.download_file(BUCKET, staging_key, staged_path)
+                size = os.path.getsize(staged_path)
+                log("download.staging", filename=filename,
+                    size_bytes=size, elapsed_s=round(time.time() - t0, 3))
 
                 index = read_index_json(staged_path)
                 subdir = index.get("subdir")
@@ -115,37 +167,50 @@ def ingest_batch(channel: str, files: list[dict]) -> dict[str, str]:
                 os.makedirs(subdir_path, exist_ok=True)
                 os.replace(staged_path, os.path.join(subdir_path, filename))
                 by_subdir.setdefault(subdir, []).append(filename)
-            except Exception as e:  # noqa: BLE001 — reported per-file, not fatal to the batch
+            except Exception as e:  # noqa: BLE001
+                log("download.staging.error", filename=filename, error=str(e))
                 results[filename] = f"error: {e}"
 
-        # Phase 2: one conda-index run per distinct subdir touched, covering
-        # every file destined for it in this batch at once.
+        # Phase 2: one conda-index run per distinct subdir touched.
         for subdir, filenames in by_subdir.items():
             subdir_path = os.path.join(channel_root, subdir)
             prefix = f"{channel}/{subdir}/"
             try:
+                t0 = time.time()
                 _download_cache(prefix, subdir_path)
-                _download_subdir(prefix, subdir_path, skip=set(filenames))
-                _run_conda_index(channel_root, subdir)
+                log("download.cache.done", subdir=subdir, elapsed_s=round(time.time() - t0, 3))
 
-                # Only commit to R2 once conda-index has succeeded locally.
-                # repodata.json — the object clients actually read — goes
-                # last, after the packages it references are already durably
-                # in R2, so no reader ever sees a repodata entry for a
-                # package that isn't actually there yet.
+                t0 = time.time()
+                n_downloaded = _download_subdir(prefix, subdir_path, skip=set(filenames))
+                log("download.existing.done", subdir=subdir,
+                    n_downloaded=n_downloaded, elapsed_s=round(time.time() - t0, 3))
+
+                t0 = time.time()
+                _run_conda_index(channel_root, subdir)
+                log("conda_index.done", subdir=subdir,
+                    n_new=len(filenames), elapsed_s=round(time.time() - t0, 3))
+
+                t0 = time.time()
                 for filename in filenames:
                     s3.upload_file(os.path.join(subdir_path, filename), BUCKET, f"{prefix}{filename}")
                 _upload_cache(prefix, subdir_path)
                 _upload_shards(subdir_path, prefix)
                 _upload_repodata(subdir_path, prefix)
+                log("upload.done", subdir=subdir,
+                    n_files=len(filenames), elapsed_s=round(time.time() - t0, 3))
 
                 for filename in filenames:
                     s3.delete_object(Bucket=BUCKET, Key=f"{channel}/_incoming/{filename}")
                     results[filename] = "ok"
-            except Exception as e:  # noqa: BLE001 — reported per-file for retry
+            except Exception as e:  # noqa: BLE001
+                log("ingest.error", subdir=subdir, error=str(e))
                 for filename in filenames:
                     results[filename] = f"error: {e}"
 
+    log("ingest_batch.done", channel=channel,
+        n_ok=sum(1 for v in results.values() if v == "ok"),
+        n_err=sum(1 for v in results.values() if v != "ok"),
+        elapsed_s=round(time.time() - t_batch, 3))
     return results
 
 
@@ -169,23 +234,20 @@ def _cached_filenames(subdir_path: str) -> set[str]:
         return set()
 
 
-def _download_subdir(prefix: str, subdir_path: str, skip: set[str] | None = None) -> None:
+def _download_subdir(prefix: str, subdir_path: str, skip: set[str] | None = None) -> int:
     """Download existing packages that conda-index actually needs on disk.
-
-    Packages already in the local cache.db are skipped — conda-index reads
-    their metadata from sqlite and never opens the package file, so downloading
-    them would be pure waste. Only packages not yet cached (truly new to this
-    channel) need to be present on disk for conda-index to extract their metadata.
-
-    `skip` is the set of filenames already staged locally from this batch."""
+    Returns the number of packages downloaded."""
     skip = (skip or set()) | _cached_filenames(subdir_path)
     paginator = s3.get_paginator("list_objects_v2")
+    n = 0
     for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
             fname = obj["Key"][len(prefix):]
             if not fname or fname in skip or not fname.endswith(PACKAGE_EXTENSIONS):
                 continue
             s3.download_file(BUCKET, obj["Key"], os.path.join(subdir_path, fname))
+            n += 1
+    return n
 
 
 def _download_cache(prefix: str, subdir_path: str) -> None:
@@ -256,19 +318,25 @@ def _upload_shards(subdir_path: str, prefix: str) -> None:
 
 
 def _upload_repodata(subdir_path: str, prefix: str) -> None:
-    # Covers both repodata.json (monolithic) and repodata_shards.msgpack.zst
-    # (the shard index) — both start with "repodata". The index is
-    # short-lived per CEP-16's own recommendation (seconds-to-hours), unlike
-    # the shards themselves, so no immutable Cache-Control here.
+    # Files conda clients actually consume:
+    #   repodata.json                     — monolithic package index
+    #   repodata_shards.msgpack.zst       — CEP-16 shard index
+    #   patch_instructions.json           — repodata patches (hotfixes etc.)
+    #
+    # Intentionally skipped (not read by clients):
+    #   index.html                        — human-browsable listing
+    #   repodata_from_packages.json       — raw pre-patch repodata
+    #   repodata_shards_from_packages.*   — raw pre-patch shard source
+    UPLOAD_NAMES = {"repodata.json", "repodata_shards.msgpack.zst", "patch_instructions.json"}
     for fname in os.listdir(subdir_path):
-        if fname.startswith("repodata"):
+        if fname in UPLOAD_NAMES:
             s3.upload_file(os.path.join(subdir_path, fname), BUCKET, f"{prefix}{fname}")
 
 
 def reindex(channel: str, subdir: str) -> None:
-    """Standalone reindex with no new package to place — e.g. a manual
-    rebuild trigger. Downloads the full subdir since there's no local
-    file to seed from."""
+    """Standalone reindex with no new package to place."""
+    t0 = time.time()
+    log("reindex.start", channel=channel, subdir=subdir)
     with tempfile.TemporaryDirectory() as tmp:
         channel_root = os.path.join(tmp, "channel")
         subdir_path = os.path.join(channel_root, subdir)
@@ -276,11 +344,13 @@ def reindex(channel: str, subdir: str) -> None:
 
         prefix = f"{channel}/{subdir}/"
         _download_cache(prefix, subdir_path)
-        _download_subdir(prefix, subdir_path)
+        n = _download_subdir(prefix, subdir_path)
         _run_conda_index(channel_root, subdir)
         _upload_cache(prefix, subdir_path)
         _upload_shards(subdir_path, prefix)
         _upload_repodata(subdir_path, prefix)
+    log("reindex.done", channel=channel, subdir=subdir,
+        n_downloaded=n, elapsed_s=round(time.time() - t0, 3))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -345,4 +415,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    log("container.start", bucket=BUCKET)
     HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()

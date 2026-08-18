@@ -138,6 +138,8 @@ def main() -> None:
     parser.add_argument("--no-wait", action="store_true", help="Skip repodata polling after upload")
     parser.add_argument("--keep", action="store_true", help="Keep downloaded packages after upload")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible package selection")
+    parser.add_argument("--stats", metavar="FILE", default=None,
+                        help="Write per-package upload stats to a JSON file (e.g. stats.json)")
     args = parser.parse_args()
 
     client = ChannelClient(worker_url=args.worker_url)
@@ -219,6 +221,38 @@ def main() -> None:
             for p in dest_dir.iterdir():
                 shutil.copy2(p, keep_dir / p.name)
             print(f"Packages kept in {keep_dir}\n")
+
+        if args.stats:
+            stats = {
+                "run": {
+                    "channel": args.channel,
+                    "worker_url": args.worker_url,
+                    "n_selected": len(selected),
+                    "n_ok": ok_count,
+                    "n_err": errors,
+                    "wall_s": round(wall, 3),
+                    "ok_bytes": ok_bytes,
+                    "throughput_mbps": round(ok_bytes / 1024 / 1024 / wall, 4) if wall > 0 else 0,
+                    "pkgs_per_s": round(ok_count / wall, 3) if wall > 0 else 0,
+                    "ts": time.time(),
+                },
+                "packages": [
+                    {
+                        "filename": fname,
+                        "size_bytes": futures[f].get("size", 0) if (f := next((k for k, v in futures.items() if v["filename"] == fname), None)) else 0,
+                        "elapsed_s": round(elapsed, 3),
+                        "error": error,
+                    }
+                    for fname, elapsed, error in results
+                ],
+            }
+            # resolve size_bytes properly without the nested comprehension trick
+            fname_to_meta = {m["filename"]: m for m in selected}
+            for pkg in stats["packages"]:
+                pkg["size_bytes"] = fname_to_meta.get(pkg["filename"], {}).get("size", 0)
+
+            pathlib.Path(args.stats).write_text(json.dumps(stats, indent=2))
+            print(f"Stats written to {args.stats}\n")
 
     # Poll repodata
     if not args.no_wait and ok_count > 0:
