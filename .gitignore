@@ -10,4 +10,5 @@ dist/
 __pycache__/
 *.pyc
 scripts/fixtures/
+scripts/mirror-cache/
 dist/
