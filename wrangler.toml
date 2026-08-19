@@ -39,5 +39,5 @@ new_sqlite_classes = ["PackageIngestor", "SubdirIndexMerger"]
 [[containers]]
 class_name = "IndexerContainer"
 image = "./container/Dockerfile"
-max_instances = 10       # more instances — each handles one package, not a whole subdir
-instance_type = "basic"  # lighter — just downloads one file + extracts metadata
+max_instances = 10      # pool of 10 workers shared across all channels
+instance_type = "basic" # one file download + metadata extraction per request
