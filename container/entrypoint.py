@@ -626,21 +626,10 @@ def rebuild_browse_from_repodata(channel: str) -> dict:
 
 
 def _register_channel(channel: str) -> None:
-    """Add this channel to the global _channels-index.json and to D1 channels table."""
-    key = "_channels-index.json"
-    names = set()
-    try:
-        existing = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
-        names = set(existing.get("channels", []))
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
-            raise
-    if channel not in names:
-        names.add(channel)
-        s3.put_object(Bucket=BUCKET, Key=key,
-                      Body=json.dumps({"channels": sorted(names)}).encode(),
-                      ContentType="application/json")
-    # Also ensure the channel row exists in D1 (best-effort).
+    """Ensure the channel row exists in D1 (best-effort).
+    The _channels-index.json R2 object has been removed — D1 is the source
+    of truth for channel listing.
+    """
     if WORKER_URL:
         try:
             body = json.dumps({"channel": channel, "name": channel,
