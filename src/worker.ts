@@ -482,6 +482,27 @@ export default {
       return handleAbortMultipart(request, env);
     }
 
+    // POST /internal/list-r2 — list R2 keys under a prefix.
+    // Body: { prefix: string, cursor?: string, limit?: number }
+    // Returns { keys: string[], done: bool, next_cursor? }
+    if (url.pathname === "/internal/list-r2" && request.method === "POST") {
+      const auth = request.headers.get("authorization") ?? "";
+      const token = auth.replace(/^Bearer\s+/i, "");
+      const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
+      if (!claims) return new Response("unauthorized", { status: 401 });
+      const body = await request.json<{ prefix?: string; cursor?: string; limit?: number }>();
+      const list = await env.CHANNEL_BUCKET.list({
+        prefix: body.prefix ?? "",
+        cursor: body.cursor,
+        limit: body.limit ?? 1000,
+      });
+      return Response.json({
+        keys: list.objects.map(o => o.key),
+        done: !list.truncated,
+        ...(list.truncated ? { next_cursor: list.cursor } : {}),
+      });
+    }
+
     // --- Legacy redirects: flat channel names → namespaced ---
     // Handles /channels/anaconda-cloud*, /repo/anaconda-cloud*, /channel/anaconda-cloud*
     const legacyRedirects: Record<string, string> = {
@@ -674,8 +695,7 @@ async function handleR2Get(request: Request, channel: string, key: string, env: 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Browse UI — anaconda.org-style package listing, search, sort, pagination.
-// Reads the channel's browse-index.json (built by the container in Tier 2/3),
-// filters/sorts/paginates in the Worker, renders HTML fragments for htmx.
+// Reads from D1 (packages table) — fast, no R2 round-trip.
 // ---------------------------------------------------------------------------
 interface BrowseRecord {
   name: string;

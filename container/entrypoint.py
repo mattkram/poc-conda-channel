@@ -535,9 +535,9 @@ def rebuild_index_and_repodata(channel: str, subdir: str) -> dict:
 
 
 def _rebuild_browse_index(channel: str) -> None:
-    """Aggregate every per-name browse record under <channel>/_browse/ into a
-    single browse-index.json served to the browse UI. Small (low single-digit
-    MB even at conda-forge scale)."""
+    """Aggregate every per-name browse record under <channel>/_browse/ and
+    bulk-upsert them into D1. The browse UI reads from D1; the old
+    browse-index.json R2 file is no longer written."""
     t0 = time.time()
     records = []
     paginator = s3.get_paginator("list_objects_v2")
@@ -552,12 +552,8 @@ def _rebuild_browse_index(channel: str) -> None:
             except Exception:  # noqa: BLE001
                 continue
     records.sort(key=lambda r: (r.get("name") or "").lower())
-    body = json.dumps({"packages": records}).encode()
-    s3.put_object(Bucket=BUCKET, Key=f"{channel}/browse-index.json",
-                  Body=body, CacheControl="public, max-age=300",
-                  ContentType="application/json")
-    # Bulk-upsert all records into D1 in parallel — single logical operation
-    # after every index rebuild, keeping D1 in sync automatically.
+    # Bulk-upsert all records into D1 — single logical operation after every
+    # index rebuild, keeping D1 in sync automatically.
     _bulk_upsert_d1(channel, records)
     log("browse_index.done", channel=channel, n=len(records),
         elapsed_s=round(time.time() - t0, 3))
