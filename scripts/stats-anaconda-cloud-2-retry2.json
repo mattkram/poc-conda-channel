@@ -1,0 +1,86 @@
+{
+  "run": {
+    "channel": "anaconda-cloud-2",
+    "source": "https://conda.anaconda.org/anaconda-cloud",
+    "subdirs": [
+      "noarch"
+    ],
+    "ul_workers": 2,
+    "dl_workers": 2,
+    "n_selected": 5,
+    "n_ok": 5,
+    "n_err": 0,
+    "wall_s": 45.122,
+    "ok_bytes": 136328580,
+    "throughput_mbps": 2.8814,
+    "pkgs_per_s": 0.111,
+    "avg_dl_s": 13.039,
+    "avg_init_s": 0.673,
+    "avg_put_s": 10.726,
+    "avg_complete_s": 0.62,
+    "avg_ul_s": 12.02,
+    "ts": 1787169722.443916
+  },
+  "packages": [
+    {
+      "filename": "aext-cloud-4.30.0-py_jl4_0.conda",
+      "subdir": "noarch",
+      "size_bytes": 31061342,
+      "dl_s": 2.824,
+      "init_s": 0.229,
+      "put_s": 8.742,
+      "complete_s": 0.943,
+      "ul_s": 9.914,
+      "elapsed_s": 12.738,
+      "error": null
+    },
+    {
+      "filename": "aext-cloud-4.31.0-py_jl4_0.conda",
+      "subdir": "noarch",
+      "size_bytes": 31375712,
+      "dl_s": 3.54,
+      "init_s": 2.38,
+      "put_s": 18.843,
+      "complete_s": 0.839,
+      "ul_s": 22.062,
+      "elapsed_s": 25.602,
+      "error": null
+    },
+    {
+      "filename": "aext-cloud-4.49.0-py_jl4_0.conda",
+      "subdir": "noarch",
+      "size_bytes": 33040705,
+      "dl_s": 9.391,
+      "init_s": 0.27,
+      "put_s": 14.373,
+      "complete_s": 0.367,
+      "ul_s": 15.01,
+      "elapsed_s": 24.401,
+      "error": null
+    },
+    {
+      "filename": "aext-cloud-4.5.0-py_jl4_0.conda",
+      "subdir": "noarch",
+      "size_bytes": 7644560,
+      "dl_s": 16.819,
+      "init_s": 0.277,
+      "put_s": 2.618,
+      "complete_s": 0.545,
+      "ul_s": 3.44,
+      "elapsed_s": 20.259,
+      "error": null
+    },
+    {
+      "filename": "aext-cloud-4.33.0-py_jl4_0.conda",
+      "subdir": "noarch",
+      "size_bytes": 33206261,
+      "dl_s": 32.621,
+      "init_s": 0.211,
+      "put_s": 9.056,
+      "complete_s": 0.408,
+      "ul_s": 9.675,
+      "elapsed_s": 42.296,
+      "error": null
+    }
+  ]
+}
