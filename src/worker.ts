@@ -142,6 +142,13 @@ export class ChannelQueue extends DurableObject<Env> {
       return Response.json({ allowed: false, owner }, { status: 403 });
     }
 
+    if (url.pathname === "/purge" && request.method === "POST") {
+      const all = await this.ctx.storage.list({ prefix: "pending:" });
+      await this.ctx.storage.delete([...all.keys()]);
+      await this.ctx.storage.deleteAlarm();
+      return Response.json({ purged: all.size });
+    }
+
     return new Response("not found", { status: 404 });
   }
 
@@ -228,6 +235,13 @@ export class ChannelIngestQueue extends DurableObject<Env> {
         await this.ctx.storage.setAlarm(Date.now() + INGEST_QUEUE_DRAIN_MS);
       }
       return new Response("queued", { status: 202 });
+    }
+    if (url.pathname === "/purge" && request.method === "POST") {
+      // Delete all pending work items and cancel the alarm.
+      const all = await this.ctx.storage.list({ prefix: "work:" });
+      await this.ctx.storage.delete([...all.keys()]);
+      await this.ctx.storage.deleteAlarm();
+      return Response.json({ purged: all.size });
     }
     return new Response("not found", { status: 404 });
   }
@@ -453,6 +467,19 @@ export default {
     // Returns: { deleted, done, next_cursor? }
     if (url.pathname === "/internal/delete-r2-prefix" && request.method === "POST") {
       return handleDeleteR2Prefix(request, env);
+    }
+
+    // POST /internal/purge-queue/<channel> — clear all pending ingest work for a channel.
+    // Stops the ChannelIngestQueue DO from retrying stale/deleted uploads forever.
+    const purgeQueueMatch = url.pathname.match(/^\/internal\/purge-queue\/([^/]+(?:\/[^/]+)?)$/);
+    if (purgeQueueMatch && request.method === "POST") {
+      return handlePurgeQueue(request, purgeQueueMatch[1], env);
+    }
+
+    // POST /internal/abort-multipart — list and abort all in-progress multipart uploads.
+    // Cleans up orphaned multipart uploads left by interrupted R2 migrations.
+    if (url.pathname === "/internal/abort-multipart" && request.method === "POST") {
+      return handleAbortMultipart(request, env);
     }
 
     // --- Legacy redirects: flat channel names → namespaced ---
@@ -1056,6 +1083,79 @@ async function handleDeleteR2Prefix(request: Request, env: Env): Promise<Respons
     done,
     ...(done ? {} : { next_cursor: list.cursor }),
   });
+}
+
+// POST /internal/purge-queue/:channel — clear all pending work from both the
+// ChannelQueue (upload debouncer) and ChannelIngestQueue (ingest serialiser) DOs.
+async function handlePurgeQueue(request: Request, channel: string, env: Env): Promise<Response> {
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
+  if (!claims) return new Response("unauthorized", { status: 401 });
+  // No ownership check — channel may have been deleted; we just need to stop alarms.
+
+  const [queueResp, ingestResp] = await Promise.all([
+    env.QUEUE.get(env.QUEUE.idFromName(channel))
+      .fetch("http://queue/purge", { method: "POST" })
+      .then(r => r.json<{ purged: number }>()),
+    env.INGEST_QUEUE.get(env.INGEST_QUEUE.idFromName(channel))
+      .fetch("http://queue/purge", { method: "POST" })
+      .then(r => r.json<{ purged: number }>()),
+  ]);
+
+  return Response.json({
+    channel,
+    queue_purged: queueResp.purged,
+    ingest_queue_purged: ingestResp.purged,
+  });
+}
+
+// POST /internal/abort-multipart — list and abort all in-progress multipart uploads in R2.
+async function handleAbortMultipart(request: Request, env: Env): Promise<Response> {
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
+  if (!claims) return new Response("unauthorized", { status: 401 });
+
+  const client = r2Client(env);
+  const bucketUrl = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET_NAME}`;
+
+  // List multipart uploads
+  const listReq = await client.sign(
+    new Request(`${bucketUrl}?uploads`, { method: "GET" })
+  );
+  const listResp = await fetch(listReq);
+  const listXml = await listResp.text();
+
+  // Parse upload IDs and keys from XML
+  const uploads: Array<{ key: string; uploadId: string }> = [];
+  const keyMatches = listXml.matchAll(/<Key>([^<]+)<\/Key>\s*<UploadId>([^<]+)<\/UploadId>/g);
+  for (const m of keyMatches) {
+    uploads.push({ key: m[1], uploadId: m[2] });
+  }
+
+  // Abort each one
+  let aborted = 0, errors = 0;
+  for (const { key, uploadId } of uploads) {
+    try {
+      const abortReq = await client.sign(
+        new Request(
+          `${bucketUrl}/${encodeURIComponent(key)}?uploadId=${encodeURIComponent(uploadId)}`,
+          { method: "DELETE" }
+        )
+      );
+      const abortResp = await fetch(abortReq);
+      if (abortResp.ok || abortResp.status === 204) {
+        aborted++;
+      } else {
+        errors++;
+      }
+    } catch {
+      errors++;
+    }
+  }
+
+  return Response.json({ found: uploads.length, aborted, errors });
 }
 
 async function handleRebuildBrowse(request: Request, channel: string, env: Env): Promise<Response> {
