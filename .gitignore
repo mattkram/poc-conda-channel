@@ -12,3 +12,5 @@ __pycache__/
 scripts/fixtures/
 scripts/mirror-cache/
 dist/
+
+env/
