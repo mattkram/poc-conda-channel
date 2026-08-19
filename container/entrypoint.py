@@ -561,6 +561,7 @@ def rebuild_browse_from_repodata(channel: str) -> dict:
                       Body=json.dumps(r).encode(), ContentType="application/json")
 
     _rebuild_browse_index(channel)
+    _register_channel(channel)
     log("rebuild_browse.done", channel=channel, n_names=len(recs),
         n_subdirs=len(subdirs), elapsed_s=round(time.time() - t0, 3))
     return {"n_names": len(recs), "n_subdirs": len(subdirs)}
