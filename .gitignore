@@ -11,6 +11,7 @@ __pycache__/
 *.pyc
 scripts/fixtures/
 scripts/mirror-cache/
+scripts/stats-*.json
 dist/
 
 env/
