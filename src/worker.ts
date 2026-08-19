@@ -692,12 +692,22 @@ function renderResults(channel: string, records: BrowseRecord[], q: string, sort
       </div>`).join("")
     : `<div class="empty">No packages match &ldquo;${esc(q)}&rdquo;.</div>`;
 
-  const qs = (p: number) => `?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&page=${p}`;
+  const canonicalQs = (p: number) => {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (sort !== "name-asc") params.set("sort", sort);
+    if (p > 1) params.set("page", String(p));
+    const s = params.toString();
+    return s ? "?" + s : "";
+  };
+  // /results always needs all params for the server to render correctly
+  const resultsQs = (p: number) =>
+    `?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&page=${p}`;
   const pager = pages > 1 ? `
     <div class="pager">
-      ${cur > 1 ? `<a href="/channels/${channel}${qs(cur - 1)}" hx-get="/channels/${channel}/results${qs(cur - 1)}" hx-target="#results">&lsaquo; Prev</a>` : ""}
+      ${cur > 1 ? `<a href="/channels/${channel}${canonicalQs(cur - 1)}" hx-get="/channels/${channel}/results${resultsQs(cur - 1)}" hx-target="#results" hx-push-url="/channels/${channel}${canonicalQs(cur - 1)}">&lsaquo; Prev</a>` : ""}
       <span class="cur">${cur} / ${pages}</span>
-      ${cur < pages ? `<a href="/channels/${channel}${qs(cur + 1)}" hx-get="/channels/${channel}/results${qs(cur + 1)}" hx-target="#results">Next &rsaquo;</a>` : ""}
+      ${cur < pages ? `<a href="/channels/${channel}${canonicalQs(cur + 1)}" hx-get="/channels/${channel}/results${resultsQs(cur + 1)}" hx-target="#results" hx-push-url="/channels/${channel}${canonicalQs(cur + 1)}">Next &rsaquo;</a>` : ""}
     </div>` : "";
 
   return `<div class="count">${total} package${total === 1 ? "" : "s"}</div>${rows}${pager}`;
@@ -890,8 +900,21 @@ async function handleBrowseResults(request: Request, channel: string, url: URL, 
   const sort = url.searchParams.get("sort") ?? "name-asc";
   const page = parseInt(url.searchParams.get("page") ?? "1", 10) || 1;
   const records = await loadBrowseIndex(channel, env, q, sort);
+
+  // Build the canonical page URL so htmx pushes /channels/:channel?... into the
+  // browser history rather than the /results partial URL.
+  const canonicalParams = new URLSearchParams();
+  if (q) canonicalParams.set("q", q);
+  if (sort !== "name-asc") canonicalParams.set("sort", sort);
+  if (page > 1) canonicalParams.set("page", String(page));
+  const canonicalSearch = canonicalParams.toString();
+  const pushUrl = `/channels/${channel}${canonicalSearch ? "?" + canonicalSearch : ""}`;
+
   return new Response(renderResults(channel, records, q, sort, page), {
-    headers: { "content-type": "text/html;charset=utf-8" },
+    headers: {
+      "content-type": "text/html;charset=utf-8",
+      "HX-Push-Url": pushUrl,
+    },
   });
 }
 
