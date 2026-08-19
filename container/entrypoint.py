@@ -28,6 +28,7 @@ import os
 import subprocess
 import tempfile
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import boto3
@@ -40,6 +41,10 @@ R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
 R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
 R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
 BUCKET = os.environ.get("R2_BUCKET_NAME", "conda-channel")
+
+# Worker URL for D1 upserts. Set via envVars in IndexerContainer.
+# If unset (e.g. local dev), D1 upserts are skipped silently.
+WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 
 s3 = boto3.client(
     "s3",
@@ -85,6 +90,37 @@ def log(event: str, **kwargs) -> None:
         **kwargs,
     }
     print(json.dumps(record), flush=True)
+
+
+def _upsert_d1(channel: str, browse: dict) -> None:
+    """POST a browse record to the Worker's D1 upsert endpoint.
+
+    Best-effort: failures are logged but never raise. R2 is the source of
+    truth; the Worker's /internal/reconcile/<channel> endpoint can always
+    rebuild D1 from R2 if they drift.
+    """
+    if not WORKER_URL:
+        return
+    try:
+        body = json.dumps({
+            "channel": channel,
+            "name": browse.get("name", ""),
+            "version": browse.get("version", ""),
+            "summary": browse.get("summary") or None,
+            "license": browse.get("license") or None,
+            "home": browse.get("home") or None,
+            "subdirs": browse.get("subdirs", []),
+        }).encode()
+        req = urllib.request.Request(
+            f"{WORKER_URL}/internal/upsert-package",
+            data=body,
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    except Exception as exc:
+        log("d1_upsert.error", channel=channel, name=browse.get("name"), error=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +343,8 @@ def ingest_package(channel: str, filename: str, staging_key: str) -> dict:
     browse["subdirs"] = sorted(subdirs_seen)
     s3.put_object(Bucket=BUCKET, Key=browse_key,
                   Body=json.dumps(browse).encode(), ContentType="application/json")
+    # Mirror to D1 for fast website queries (best-effort, R2 is source of truth).
+    _upsert_d1(channel, browse)
 
     # Move the package file into its final location and drop staging.
     s3.copy_object(Bucket=BUCKET, Key=f"{prefix}/{filename}",
@@ -559,6 +597,8 @@ def rebuild_browse_from_repodata(channel: str) -> dict:
             pass
         s3.put_object(Bucket=BUCKET, Key=browse_key,
                       Body=json.dumps(r).encode(), ContentType="application/json")
+        # Mirror to D1 (best-effort).
+        _upsert_d1(channel, r)
 
     _rebuild_browse_index(channel)
     _register_channel(channel)

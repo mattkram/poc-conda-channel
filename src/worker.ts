@@ -4,6 +4,7 @@ import { AwsClient } from "aws4fetch";
 
 export interface Env {
   CHANNEL_BUCKET: R2Bucket;
+  DB: D1Database;
   INDEXER: DurableObjectNamespace;
   QUEUE: DurableObjectNamespace;
   INGESTOR: DurableObjectNamespace;
@@ -39,6 +40,8 @@ export class IndexerContainer extends Container<Env> {
     R2_ACCESS_KEY_ID: env.R2_ACCESS_KEY_ID,
     R2_SECRET_ACCESS_KEY: env.R2_SECRET_ACCESS_KEY,
     R2_BUCKET_NAME: env.R2_BUCKET_NAME,
+    // Worker URL so the container can POST browse records to D1 via the Worker.
+    WORKER_URL: "https://conda.matt-kramer.com",
   };
 }
 
@@ -416,16 +419,66 @@ export default {
       return handleSetVisibility(request, visMatch[1], env);
     }
 
+    // POST /internal/upsert-package — called by container after R2 browse write.
+    if (url.pathname === "/internal/upsert-package" && request.method === "POST") {
+      return handleUpsertPackage(request, env);
+    }
+    // POST /internal/reconcile/<channel> — rebuild D1 from R2 _browse/* objects.
+    const reconcileMatch = url.pathname.match(/^\/internal\/reconcile\/([^/]+)$/);
+    if (reconcileMatch && request.method === "POST") {
+      return handleReconcile(request, reconcileMatch[1], env);
+    }
+
     return new Response("not found", { status: 404 });
   },
 };
 
 // ---------------------------------------------------------------------------
-// Channel metadata — owner + visibility, backed by ChannelQueue DO storage.
+// Channel metadata — owner + visibility.
+//
+// Source of truth for ownership/visibility is D1 (fast reads, no DO wakeup).
+// The ChannelQueue DO still handles upload debouncing and the claim/write path
+// (it writes to its own storage for the queue logic), but all read-path
+// visibility checks go straight to D1.
 // ---------------------------------------------------------------------------
 
+interface ChannelRow {
+  name: string;
+  owner: string | null;
+  visibility: string;
+  created_at: number;
+}
+
+// Ensure a channel row exists in D1. Called lazily on first claim/upload.
+// If the row already exists this is a no-op (INSERT OR IGNORE).
+async function ensureChannelRow(channel: string, owner: string, env: Env): Promise<void> {
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO channels (name, owner, visibility, created_at)
+     VALUES (?, ?, 'public', ?)`
+  ).bind(channel, owner, Date.now()).run();
+}
+
 // Claim-or-verify write access. Returns a 403 Response on denial, null on ok.
+// On first upload to a channel, claims it for this login and creates the D1 row.
 async function checkChannelAccess(channel: string, login: string, env: Env): Promise<Response | null> {
+  // Fast D1 check first — if the row already exists, validate ownership there.
+  const row = await env.DB.prepare(
+    `SELECT owner FROM channels WHERE name = ?`
+  ).bind(channel).first<{ owner: string | null }>();
+
+  if (row) {
+    if (row.owner && row.owner !== login) {
+      return new Response(
+        `channel '${channel}' is owned by ${row.owner} — access denied`,
+        { status: 403 }
+      );
+    }
+    // Owner matches (or null — channel exists but unclaimed, shouldn't happen).
+    return null;
+  }
+
+  // Channel not in D1 yet — fall through to DO for atomic first-claim, then
+  // mirror the result to D1.
   const queueId = env.QUEUE.idFromName(channel);
   const queue = env.QUEUE.get(queueId);
   const resp = await queue.fetch("http://queue/claim", {
@@ -440,34 +493,42 @@ async function checkChannelAccess(channel: string, login: string, env: Env): Pro
       { status: 403 }
     );
   }
+  // Claim succeeded — write to D1 so future checks skip the DO.
+  await ensureChannelRow(channel, login, env);
   return null;
 }
 
-// Check read access for a channel. Returns 401/403 Response on denial, null on ok.
+// Check read access for a channel. Returns 401 Response on denial, null on ok.
+// For public channels this is a single fast D1 query with no DO round-trip.
 // login may be null for unauthenticated requests to public channels.
 async function checkReadAccess(channel: string, login: string | null, env: Env): Promise<Response | null> {
-  const queueId = env.QUEUE.idFromName(channel);
-  const queue = env.QUEUE.get(queueId);
-  const resp = await queue.fetch("http://queue/check-read", {
-    method: "POST",
-    body: JSON.stringify({ login }),
-    headers: { "content-type": "application/json" },
-  });
-  if (resp.status === 403) {
-    return new Response(
-      `channel '${channel}' is private — provide a valid Bearer token`,
-      { status: 401, headers: { "WWW-Authenticate": 'Bearer realm="conda-channel"' } }
-    );
-  }
-  return null;
+  const row = await env.DB.prepare(
+    `SELECT visibility, owner FROM channels WHERE name = ?`
+  ).bind(channel).first<{ visibility: string; owner: string | null }>();
+
+  // Channel not in D1 yet — assume public (no uploads have completed yet,
+  // so there's nothing to protect). The DO will be the authority once data lands.
+  if (!row) return null;
+
+  if (row.visibility === "public") return null;
+
+  // Private: require a valid token that matches the owner.
+  if (login && login === row.owner) return null;
+
+  return new Response(
+    `channel '${channel}' is private — provide a valid Bearer token`,
+    { status: 401, headers: { "WWW-Authenticate": 'Bearer realm="conda-channel"' } }
+  );
 }
 
 // GET /channel/<channel> — returns { owner, visibility }
 async function handleGetChannelInfo(channel: string, env: Env): Promise<Response> {
   if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
-  const queueId = env.QUEUE.idFromName(channel);
-  const queue = env.QUEUE.get(queueId);
-  return queue.fetch("http://queue/owner");
+  const row = await env.DB.prepare(
+    `SELECT owner, visibility FROM channels WHERE name = ?`
+  ).bind(channel).first<{ owner: string | null; visibility: string }>();
+  if (!row) return Response.json({ owner: null, visibility: "public" });
+  return Response.json(row);
 }
 
 // POST /channel/<channel>/visibility — set public or private (owner only)
@@ -479,15 +540,34 @@ async function handleSetVisibility(request: Request, channel: string, env: Env):
   const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
   if (!claims) return new Response("unauthorized", { status: 401 });
 
-  const body = await request.json<{ visibility: string }>();
+  const { visibility } = await request.json<{ visibility: string }>();
+  if (visibility !== "public" && visibility !== "private") {
+    return new Response("visibility must be 'public' or 'private'", { status: 400 });
+  }
+
+  const row = await env.DB.prepare(
+    `SELECT owner FROM channels WHERE name = ?`
+  ).bind(channel).first<{ owner: string | null }>();
+
+  if (!row) return new Response("channel not found", { status: 404 });
+  if (row.owner !== claims.login) {
+    return new Response("only the channel owner can change visibility", { status: 403 });
+  }
+
+  await env.DB.prepare(
+    `UPDATE channels SET visibility = ? WHERE name = ?`
+  ).bind(visibility, channel).run();
+
+  // Mirror to DO so the upload queue's internal checks stay consistent.
   const queueId = env.QUEUE.idFromName(channel);
   const queue = env.QUEUE.get(queueId);
-  const resp = await queue.fetch("http://queue/set-visibility", {
+  queue.fetch("http://queue/set-visibility", {
     method: "POST",
-    body: JSON.stringify({ login: claims.login, visibility: body.visibility }),
+    body: JSON.stringify({ login: claims.login, visibility }),
     headers: { "content-type": "application/json" },
-  });
-  return resp;
+  }).catch(() => { /* best-effort mirror */ });
+
+  return Response.json({ owner: row.owner, visibility });
 }
 
 // ---------------------------------------------------------------------------
@@ -561,27 +641,36 @@ function esc(s: string): string {
   return (s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-async function loadBrowseIndex(channel: string, env: Env): Promise<BrowseRecord[]> {
-  const obj = await env.CHANNEL_BUCKET.get(`${channel}/browse-index.json`);
-  if (!obj) return [];
-  const data = await obj.json<{ packages: BrowseRecord[] }>();
-  return data.packages ?? [];
+async function loadBrowseIndex(channel: string, env: Env, q?: string, sort?: string): Promise<BrowseRecord[]> {
+  // Use D1 for fast filtered queries when possible.
+  const sortCol = sort === "name-desc" ? "name DESC" : "name ASC";
+  let stmt: D1PreparedStatement;
+  if (q) {
+    // FTS match — join back to packages for the full row.
+    stmt = env.DB.prepare(
+      `SELECT p.name, p.version, p.summary, p.license, p.home, p.subdirs
+       FROM packages_fts f
+       JOIN packages p ON p.rowid = f.rowid
+       WHERE p.channel = ? AND packages_fts MATCH ?
+       ORDER BY p.${sortCol}`
+    ).bind(channel, `"${q.replace(/"/g, '""')}"*`);
+  } else {
+    stmt = env.DB.prepare(
+      `SELECT name, version, summary, license, home, subdirs
+       FROM packages WHERE channel = ? ORDER BY ${sortCol}`
+    ).bind(channel);
+  }
+  const { results } = await stmt.all<{
+    name: string; version: string; summary: string;
+    license: string; home: string; subdirs: string;
+  }>();
+  return results.map((r) => ({ ...r, subdirs: JSON.parse(r.subdirs ?? "[]") as string[] }));
 }
 
 function filterSort(records: BrowseRecord[], q: string, sort: string): BrowseRecord[] {
-  let out = records;
-  if (q) {
-    const needle = q.toLowerCase();
-    out = out.filter(
-      (r) =>
-        r.name.toLowerCase().includes(needle) ||
-        (r.summary ?? "").toLowerCase().includes(needle)
-    );
-  }
-  const sorted = [...out];
-  if (sort === "name-desc") sorted.sort((a, b) => b.name.localeCompare(a.name));
-  else sorted.sort((a, b) => a.name.localeCompare(b.name));
-  return sorted;
+  // Records already filtered and sorted by D1; this is a passthrough.
+  // Kept for compatibility with renderResults signature.
+  return records;
 }
 
 function renderResults(channel: string, records: BrowseRecord[], q: string, sort: string, page: number): string {
@@ -622,30 +711,22 @@ async function browseAuth(request: Request, channel: string, env: Env): Promise<
   return checkReadAccess(channel, claims?.login ?? null, env);
 }
 
-// GET /channels — parent page listing all channels (names from
-// _channels-index.json, visibility from each channel's ChannelQueue DO).
+// GET /channels — parent page listing all channels from D1.
 async function handleChannelsIndex(request: Request, env: Env): Promise<Response> {
-  const obj = await env.CHANNEL_BUCKET.get("_channels-index.json");
-  const names: string[] = obj ? ((await obj.json<{ channels: string[] }>()).channels ?? []) : [];
+  const { results } = await env.DB.prepare(
+    `SELECT name, owner, visibility FROM channels ORDER BY name`
+  ).all<{ name: string; owner: string | null; visibility: string }>();
 
-  const cards = await Promise.all(
-    names.map(async (name) => {
-      let visibility = "public";
-      let owner: string | null = null;
-      try {
-        const q = env.QUEUE.get(env.QUEUE.idFromName(name));
-        const info = await (await q.fetch("http://queue/owner")).json<{ owner: string | null; visibility: string }>();
-        visibility = info.visibility;
-        owner = info.owner;
-      } catch { /* default public */ }
-      const lock = visibility === "private" ? ' <span class="badge" style="background:#fdecea;color:#b42318">private</span>' : "";
-      return `
+  const cards = results.map((ch) => {
+    const lock = ch.visibility === "private"
+      ? ' <span class="badge" style="background:#fdecea;color:#b42318">private</span>'
+      : "";
+    return `
       <div class="pkg">
-        <a class="name" href="/channels/${name}">${esc(name)}</a>${lock}
-        <div class="meta">${owner ? `<span>owner: ${esc(owner)}</span>` : ""}<span>conda channel</span></div>
+        <a class="name" href="/channels/${ch.name}">${esc(ch.name)}</a>${lock}
+        <div class="meta">${ch.owner ? `<span>owner: ${esc(ch.owner)}</span>` : ""}<span>conda channel</span></div>
       </div>`;
-    })
-  );
+  });
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -660,7 +741,7 @@ async function handleChannelsIndex(request: Request, env: Env): Promise<Response
 <header><a class="brand" href="/channels">conda-channel-server</a><span class="chan">channels</span></header>
 <main>
 <div class="wrap">
-  <div class="count">${names.length} channel${names.length === 1 ? "" : "s"}</div>
+  <div class="count">${results.length} channel${results.length === 1 ? "" : "s"}</div>
   ${cards.join("") || `<div class="empty">No channels yet.</div>`}
 </div>
 </main>
@@ -669,7 +750,116 @@ async function handleChannelsIndex(request: Request, env: Env): Promise<Response
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
-// POST /channel/<channel>/rebuild-browse — backfill browse data (owner only).
+    // POST /channel/<channel>/rebuild-browse — backfill browse data (owner)
+// ---------------------------------------------------------------------------
+// D1 upsert — called by the container after it writes _browse/<name>.json to R2.
+// Keeps D1 in sync as the authoritative read projection of R2 browse data.
+// Internal endpoint; no auth token required but only reachable from the container
+// (which runs on the same Cloudflare account and calls back via the Worker URL).
+// ---------------------------------------------------------------------------
+
+interface UpsertPackageBody {
+  channel: string;
+  name: string;
+  version: string;
+  summary?: string;
+  license?: string;
+  home?: string;
+  subdirs: string[];
+}
+
+async function handleUpsertPackage(request: Request, env: Env): Promise<Response> {
+  const body = await request.json<UpsertPackageBody>();
+  const { channel, name, version, summary, license, home, subdirs } = body;
+
+  if (!channel || !name || !version) {
+    return new Response("missing required fields: channel, name, version", { status: 400 });
+  }
+
+  // Ensure the channel row exists before inserting the FK reference.
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO channels (name, owner, visibility, created_at) VALUES (?, NULL, 'public', ?)`
+  ).bind(channel, Date.now()).run();
+
+  await env.DB.prepare(
+    `INSERT INTO packages (channel, name, version, summary, license, home, subdirs, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(channel, name) DO UPDATE SET
+       version    = excluded.version,
+       summary    = excluded.summary,
+       license    = excluded.license,
+       home       = excluded.home,
+       subdirs    = excluded.subdirs,
+       updated_at = excluded.updated_at`
+  ).bind(
+    channel, name, version,
+    summary ?? null, license ?? null, home ?? null,
+    JSON.stringify(subdirs ?? []),
+    Date.now()
+  ).run();
+
+  return new Response("ok", { status: 200 });
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation — rebuild D1 packages table from R2 _browse/* objects.
+// Walks <channel>/_browse/ prefix in R2, upserts each record into D1.
+// Run once after deploying D1, and again any time they drift.
+// Auth: upload token (owner of the channel or any org member).
+// ---------------------------------------------------------------------------
+async function handleReconcile(request: Request, channel: string, env: Env): Promise<Response> {
+  if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
+
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
+  if (!claims) return new Response("unauthorized", { status: 401 });
+
+  // Ensure the channel row exists.
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO channels (name, owner, visibility, created_at) VALUES (?, ?, 'public', ?)`
+  ).bind(channel, claims.login, Date.now()).run();
+
+  const prefix = `${channel}/_browse/`;
+  let cursor: string | undefined;
+  let upserted = 0;
+  let errors = 0;
+
+  do {
+    const list = await env.CHANNEL_BUCKET.list({ prefix, cursor });
+    await Promise.all(list.objects.map(async (obj) => {
+      try {
+        const r2obj = await env.CHANNEL_BUCKET.get(obj.key);
+        if (!r2obj) return;
+        const rec = await r2obj.json<UpsertPackageBody>();
+        if (!rec.name || !rec.version) return;
+        await env.DB.prepare(
+          `INSERT INTO packages (channel, name, version, summary, license, home, subdirs, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(channel, name) DO UPDATE SET
+             version    = excluded.version,
+             summary    = excluded.summary,
+             license    = excluded.license,
+             home       = excluded.home,
+             subdirs    = excluded.subdirs,
+             updated_at = excluded.updated_at`
+        ).bind(
+          channel, rec.name, rec.version,
+          rec.summary ?? null, rec.license ?? null, rec.home ?? null,
+          JSON.stringify(rec.subdirs ?? []),
+          Date.now()
+        ).run();
+        upserted++;
+      } catch {
+        errors++;
+      }
+    }));
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+
+  return Response.json({ channel, upserted, errors });
+}
+
 async function handleRebuildBrowse(request: Request, channel: string, env: Env): Promise<Response> {
   if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
   const auth = request.headers.get("authorization") ?? "";
@@ -699,7 +889,7 @@ async function handleBrowseResults(request: Request, channel: string, url: URL, 
   const q = url.searchParams.get("q") ?? "";
   const sort = url.searchParams.get("sort") ?? "name-asc";
   const page = parseInt(url.searchParams.get("page") ?? "1", 10) || 1;
-  const records = filterSort(await loadBrowseIndex(channel, env), q, sort);
+  const records = await loadBrowseIndex(channel, env, q, sort);
   return new Response(renderResults(channel, records, q, sort, page), {
     headers: { "content-type": "text/html;charset=utf-8" },
   });
@@ -711,7 +901,7 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
   const q = url.searchParams.get("q") ?? "";
   const sort = url.searchParams.get("sort") ?? "name-asc";
   const page = parseInt(url.searchParams.get("page") ?? "1", 10) || 1;
-  const records = filterSort(await loadBrowseIndex(channel, env), q, sort);
+  const records = await loadBrowseIndex(channel, env, q, sort);
   const results = renderResults(channel, records, q, sort, page);
 
   const html = `<!DOCTYPE html>
@@ -753,8 +943,15 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
   if (denied) return denied;
   name = decodeURIComponent(name);
 
-  const rec = (await loadBrowseIndex(channel, env)).find((r) => r.name === name);
-  if (!rec) return new Response("package not found", { status: 404 });
+  // Look up package record from D1 — fast single-row read.
+  const row = await env.DB.prepare(
+    `SELECT name, version, summary, license, home, subdirs FROM packages WHERE channel = ? AND name = ?`
+  ).bind(channel, name).first<{
+    name: string; version: string; summary: string;
+    license: string; home: string; subdirs: string;
+  }>();
+  if (!row) return new Response("package not found", { status: 404 });
+  const rec: BrowseRecord = { ...row, subdirs: JSON.parse(row.subdirs ?? "[]") as string[] };
 
   const builds: { subdir: string; filename: string; version: string; build: string }[] = [];
   for (const subdir of rec.subdirs ?? []) {

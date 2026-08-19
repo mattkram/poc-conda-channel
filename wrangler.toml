@@ -41,6 +41,11 @@ new_sqlite_classes = ["PackageIngestor", "SubdirIndexMerger"]
 tag = "v4"
 new_sqlite_classes = ["ChannelIngestQueue"]
 
+[[d1_databases]]
+binding = "DB"
+database_name = "conda-channel-meta"
+database_id = "405fca88-996a-4931-abd7-cbbc07d538c8"
+
 [[containers]]
 class_name = "IndexerContainer"
 image = "./container/Dockerfile"
