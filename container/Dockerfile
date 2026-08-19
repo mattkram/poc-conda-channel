@@ -5,6 +5,8 @@ RUN mamba install -y -n base \
       conda-package-streaming \
       python=3.12 \
       boto3 \
+      msgpack-python \
+      zstandard \
     && mamba clean -afy
 
 WORKDIR /app

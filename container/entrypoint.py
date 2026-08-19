@@ -1,52 +1,39 @@
 """
-Tiny HTTP server that IS the container's whole job:
+Tier 1 metadata extractor for the shard-first ingestion pipeline.
 
-  POST /ingest-batch {"channel": "main", "files": [
-      {"filename": "foo-1.0-0.conda", "uploadedAt": 173..., "uploadedBy": "..."},
-      ...
-  ]}
+  POST /extract-metadata
+    Body: {"channel": "main", "filename": "foo-1.0-0.conda", "staging_key": "main/_incoming/foo-1.0-0.conda"}
+    Returns: {"filename": "...", "subdir": "...", "name": "...", "entry": {...repodata fields...}}
 
-  POST /reindex {"channel": "main", "subdir": "noarch"}
-      Rebuild repodata for a subdir with no new package — used after a
-      package deletion so repodata no longer references the removed file.
+  POST /reindex   (legacy full rebuild — used for deletions and reconciliation only)
+    Body: {"channel": "main", "subdir": "noarch"}
 
-  POST /delete-package {"channel": "main", "subdir": "noarch", "filename": "foo-1.0-0.conda"}
-      Delete a single package from R2 then reindex its subdir.
-      The Worker calls /reindex directly after doing the R2 delete itself,
-      so this endpoint exists mainly as a convenience for direct container
-      access during testing.
+  POST /delete-package  (legacy — delete + full reindex)
+    Body: {"channel": "main", "subdir": "noarch", "filename": "foo-1.0-0.conda"}
 
-  Handles both .conda (current format) and .tar.bz2 (legacy) packages —
-  conda_package_streaming reads metadata from either uniformly, and
-  conda-index indexes both into the same repodata.json without any special
-  handling on our part.
+The hot path (/extract-metadata) is strictly per-package:
+  1. Download the staged package from R2
+  2. Extract info/index.json + optional info/run_exports.json
+  3. Compute md5, sha256, size
+  4. Return the complete repodata entry — no conda-index run, no subdir scan
 
-  Called once per debounced batch by the ChannelQueue Durable Object (see
-  src/worker.ts) rather than once per upload — so N near-simultaneous
-  uploads to the same channel produce one conda-index run, not N.
-
-  For each file:
-    1. skip it if its staging object is already gone (means a previous,
-       partially-failed batch already fully ingested it — idempotent no-op)
-    2. otherwise download it, read info/index.json to find its real
-       `subdir` (the client never supplies this), move it locally into place
-  Then, once per distinct subdir touched by this batch:
-    3. pull that subdir's conda-index cache + remaining packages, reindex
-    4. upload the new package(s) + repodata + updated cache, delete staging
-
-  Returns {"results": {filename: "ok" | "error: <msg>"}} so the caller can
-  retry only what actually failed instead of the whole batch.
+All shard assembly and repodata.json generation happens in Durable Objects
+(PackageIngestor, SubdirIndexMerger) in the Worker — the container only needs
+to read package bytes, which it must do anyway.
 """
+import hashlib
+import io
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import boto3
 import botocore.exceptions
+import msgpack
+import zstandard as zstd
 from conda_package_streaming import package_streaming
 
 R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
@@ -64,12 +51,11 @@ s3 = boto3.client(
 
 
 # ---------------------------------------------------------------------------
-# Structured logging — emits one JSON object per line to stdout.
+# Structured logging — one JSON object per line to stdout.
 # Cloudflare Containers captures stdout into Workers Logs.
 # ---------------------------------------------------------------------------
 
 def _mem_mb() -> float:
-    """Resident set size in MB from /proc/self/status (Linux only)."""
     try:
         for line in open("/proc/self/status").readlines():
             if line.startswith("VmRSS:"):
@@ -80,7 +66,6 @@ def _mem_mb() -> float:
 
 
 def _cpu_times() -> tuple[float, float]:
-    """(user_s, system_s) from /proc/self/stat."""
     try:
         fields = open("/proc/self/stat").read().split()
         clk = os.sysconf("SC_CLK_TCK")
@@ -90,7 +75,6 @@ def _cpu_times() -> tuple[float, float]:
 
 
 def log(event: str, **kwargs) -> None:
-    """Emit a structured log line to stdout."""
     cpu_u, cpu_s = _cpu_times()
     record = {
         "ts": time.time(),
@@ -102,14 +86,10 @@ def log(event: str, **kwargs) -> None:
     }
     print(json.dumps(record), flush=True)
 
-s3 = boto3.client(
-    "s3",
-    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
-    aws_access_key_id=R2_ACCESS_KEY_ID,
-    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-    region_name="auto",
-)
 
+# ---------------------------------------------------------------------------
+# Tier 1 — per-package metadata extraction (the hot path)
+# ---------------------------------------------------------------------------
 
 def _object_exists(key: str) -> bool:
     try:
@@ -121,106 +101,198 @@ def _object_exists(key: str) -> bool:
         raise
 
 
-def read_index_json(conda_path: str) -> dict:
-    """Works for both package formats — .conda (zip of zstd-compressed tars)
-    and legacy .tar.bz2 (a single bz2 tar) — via conda_package_streaming,
-    the same library conda-index and conda-build use internally. No need to
-    hand-parse either container format ourselves."""
-    for tar, member in package_streaming.stream_conda_info(conda_path):
+def _extract_info(pkg_path: str) -> dict:
+    """Extract info/index.json and info/run_exports.json from a package.
+    Works for both .conda (zip of zstd tars) and .tar.bz2."""
+    index_json = None
+    run_exports = None
+    for tar, member in package_streaming.stream_conda_info(pkg_path):
         if member.name == "info/index.json":
-            return json.load(tar.extractfile(member))
-    raise ValueError(f"info/index.json not found in {conda_path}")
+            index_json = json.load(tar.extractfile(member))
+        elif member.name == "info/run_exports.json":
+            run_exports = json.load(tar.extractfile(member))
+        if index_json is not None and run_exports is not None:
+            break
+    if index_json is None:
+        raise ValueError(f"info/index.json not found in {pkg_path}")
+    return index_json, run_exports
 
 
-def ingest_batch(channel: str, files: list[dict]) -> dict[str, str]:
-    results: dict[str, str] = {}
-    t_batch = time.time()
-    log("ingest_batch.start", channel=channel, n_files=len(files))
+def _compute_checksums(path: str) -> tuple[str, str, int]:
+    """Returns (md5_hex, sha256_hex, size_bytes)."""
+    md5 = hashlib.md5()
+    sha256 = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            md5.update(chunk)
+            sha256.update(chunk)
+            size += len(chunk)
+    return md5.hexdigest(), sha256.hexdigest(), size
+
+
+def extract_metadata(channel: str, filename: str, staging_key: str) -> dict:
+    """
+    Download the staged package, extract its repodata entry, delete staging.
+    Returns the full repodata entry dict ready to be merged into a shard.
+    Does NOT run conda-index. Does NOT touch any other package.
+    """
+    t0 = time.time()
+    log("extract_metadata.start", channel=channel, filename=filename)
+
+    if not _object_exists(staging_key):
+        # Already ingested by a previous retry — the staging object was deleted
+        # after successful ingest. Return a sentinel so the caller can skip.
+        log("extract_metadata.already_ingested", filename=filename)
+        return {"already_ingested": True}
 
     with tempfile.TemporaryDirectory() as tmp:
-        channel_root = os.path.join(tmp, "channel")
-        by_subdir: dict[str, list[str]] = {}
+        local_path = os.path.join(tmp, filename)
 
-        # Phase 1: stage every file locally and figure out where it belongs.
-        for f in files:
-            filename = f["filename"]
-            staging_key = f"{channel}/_incoming/{filename}"
+        t1 = time.time()
+        s3.download_file(BUCKET, staging_key, local_path)
+        dl_time = time.time() - t1
+        size = os.path.getsize(local_path)
+        log("extract_metadata.downloaded", filename=filename,
+            size_bytes=size, elapsed_s=round(dl_time, 3))
 
-            if not _object_exists(staging_key):
-                results[filename] = "ok"
-                continue
+        t1 = time.time()
+        index_json, run_exports = _extract_info(local_path)
+        md5, sha256, _ = _compute_checksums(local_path)
+        extract_time = time.time() - t1
+        log("extract_metadata.extracted", filename=filename,
+            elapsed_s=round(extract_time, 3))
 
-            try:
-                staged_path = os.path.join(tmp, filename)
-                t0 = time.time()
-                s3.download_file(BUCKET, staging_key, staged_path)
-                size = os.path.getsize(staged_path)
-                log("download.staging", filename=filename,
-                    size_bytes=size, elapsed_s=round(time.time() - t0, 3))
+        subdir = index_json.get("subdir")
+        if not subdir:
+            raise ValueError(f"info/index.json has no `subdir` field in {filename}")
 
-                index = read_index_json(staged_path)
-                subdir = index.get("subdir")
-                if not subdir:
-                    raise ValueError("index.json has no `subdir` field")
+        # Build the repodata entry — same fields conda-index produces.
+        entry = {**index_json, "md5": md5, "sha256": sha256, "size": size}
+        if run_exports:
+            entry["run_exports"] = run_exports
 
-                subdir_path = os.path.join(channel_root, subdir)
-                os.makedirs(subdir_path, exist_ok=True)
-                os.replace(staged_path, os.path.join(subdir_path, filename))
-                by_subdir.setdefault(subdir, []).append(filename)
-            except Exception as e:  # noqa: BLE001
-                log("download.staging.error", filename=filename, error=str(e))
-                results[filename] = f"error: {e}"
+    log("extract_metadata.done", filename=filename, subdir=subdir,
+        name=index_json.get("name"), elapsed_s=round(time.time() - t0, 3))
 
-        # Phase 2: one conda-index run per distinct subdir touched.
-        for subdir, filenames in by_subdir.items():
-            subdir_path = os.path.join(channel_root, subdir)
-            prefix = f"{channel}/{subdir}/"
-            try:
-                t0 = time.time()
-                _download_cache(prefix, subdir_path)
-                log("download.cache.done", subdir=subdir, elapsed_s=round(time.time() - t0, 3))
+    return {
+        "filename": filename,
+        "subdir": subdir,
+        "name": index_json.get("name"),
+        "entry": entry,
+    }
 
-                t0 = time.time()
-                n_downloaded = _download_subdir(prefix, subdir_path, skip=set(filenames))
-                log("download.existing.done", subdir=subdir,
-                    n_downloaded=n_downloaded, elapsed_s=round(time.time() - t0, 3))
 
-                t0 = time.time()
-                _run_conda_index(channel_root, subdir)
-                log("conda_index.done", subdir=subdir,
-                    n_new=len(filenames), elapsed_s=round(time.time() - t0, 3))
+# ---------------------------------------------------------------------------
+# Shard read/merge/write — the CEP-16 per-name shard is a msgpack+zstd file
+# keyed by content hash. This is Tier 1's actual write: append one build's
+# entry to the shard for that package name.
+# ---------------------------------------------------------------------------
 
-                t0 = time.time()
-                for filename in filenames:
-                    s3.upload_file(os.path.join(subdir_path, filename), BUCKET, f"{prefix}{filename}")
-                _upload_cache(prefix, subdir_path)
-                _upload_shards(subdir_path, prefix)
-                _upload_repodata(subdir_path, prefix)
-                log("upload.done", subdir=subdir,
-                    n_files=len(filenames), elapsed_s=round(time.time() - t0, 3))
+_ZSTD_C = zstd.ZstdCompressor(level=19)
+_ZSTD_D = zstd.ZstdDecompressor()
 
-                for filename in filenames:
-                    s3.delete_object(Bucket=BUCKET, Key=f"{channel}/_incoming/{filename}")
-                    results[filename] = "ok"
-            except Exception as e:  # noqa: BLE001
-                log("ingest.error", subdir=subdir, error=str(e))
-                for filename in filenames:
-                    results[filename] = f"error: {e}"
 
-    log("ingest_batch.done", channel=channel,
-        n_ok=sum(1 for v in results.values() if v == "ok"),
-        n_err=sum(1 for v in results.values() if v != "ok"),
-        elapsed_s=round(time.time() - t_batch, 3))
-    return results
+def _pack_shard(shard: dict) -> tuple[bytes, str]:
+    """msgpack+zstd encode a shard dict. Returns (compressed_bytes, sha256_hex)."""
+    raw = msgpack.packb(shard, use_bin_type=True)
+    compressed = _ZSTD_C.compress(raw)
+    digest = hashlib.sha256(compressed).hexdigest()
+    return compressed, digest
 
+
+def _unpack_shard(compressed: bytes) -> dict:
+    raw = _ZSTD_D.decompress(compressed)
+    return msgpack.unpackb(raw, raw=False)
+
+
+def _empty_shard() -> dict:
+    return {"packages": {}, "packages.conda": {}}
+
+
+def ingest_package(channel: str, filename: str, staging_key: str) -> dict:
+    """
+    Tier 1 hot path. Extract metadata for one package, then read-modify-write
+    the single shard for that package NAME (append this build's entry),
+    producing a new content-addressed shard object in R2.
+
+    Returns {name, subdir, new_hash, old_hash, filename} so the caller
+    (PackageIngestor DO) can update the shard index and clean up the old shard.
+    Concurrency for the same name is serialized by the PackageIngestor DO,
+    so no lock is needed here.
+    """
+    t0 = time.time()
+    meta = extract_metadata(channel, filename, staging_key)
+    if meta.get("already_ingested"):
+        return {"already_ingested": True}
+
+    name = meta["name"]
+    subdir = meta["subdir"]
+    entry = meta["entry"]
+    prefix = f"{channel}/{subdir}"
+
+    # Load the existing shard for this name, if any. The shard index maps
+    # name -> current shard hash; the DO passes it in so we avoid a second
+    # index read here.
+    old_hash = None
+    shard = _empty_shard()
+    # Discover the current shard via the name->hash pointer object we maintain
+    # at <prefix>/_shardptr/<name> (tiny, non-content-addressed, last-writer-wins).
+    ptr_key = f"{prefix}/_shardptr/{name}"
+    try:
+        ptr = s3.get_object(Bucket=BUCKET, Key=ptr_key)
+        old_hash = ptr["Body"].read().decode().strip()
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+            raise
+
+    if old_hash:
+        try:
+            existing = s3.get_object(Bucket=BUCKET, Key=f"{prefix}/{old_hash}.msgpack.zst")
+            shard = _unpack_shard(existing["Body"].read())
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+                raise
+            shard = _empty_shard()
+
+    # Append this build. .conda vs .tar.bz2 goes in the matching sub-dict.
+    bucket_key = "packages.conda" if filename.endswith(".conda") else "packages"
+    shard.setdefault(bucket_key, {})[filename] = entry
+
+    # Write the new content-addressed shard.
+    compressed, new_hash = _pack_shard(shard)
+    s3.put_object(
+        Bucket=BUCKET, Key=f"{prefix}/{new_hash}.msgpack.zst",
+        Body=compressed,
+        CacheControl="public, max-age=31536000, immutable",
+    )
+    # Update the name pointer to the new hash (last-writer-wins; DO serializes).
+    s3.put_object(Bucket=BUCKET, Key=ptr_key, Body=new_hash.encode())
+
+    # Move the package file into its final location and drop staging.
+    s3.copy_object(Bucket=BUCKET, Key=f"{prefix}/{filename}",
+                   CopySource={"Bucket": BUCKET, "Key": staging_key})
+    s3.delete_object(Bucket=BUCKET, Key=staging_key)
+
+    log("ingest_package.done", channel=channel, filename=filename, name=name,
+        subdir=subdir, old_hash=old_hash, new_hash=new_hash,
+        elapsed_s=round(time.time() - t0, 3))
+
+    return {
+        "filename": filename, "name": name, "subdir": subdir,
+        "new_hash": new_hash, "old_hash": old_hash,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Legacy full-rebuild path — used for deletions and reconciliation only.
+# Not called in the normal per-package upload flow.
+# ---------------------------------------------------------------------------
 
 PACKAGE_EXTENSIONS = (".conda", ".tar.bz2")
 
 
 def _cached_filenames(subdir_path: str) -> set[str]:
-    """Return the set of package filenames already in conda-index's sqlite cache.
-    These don't need to be downloaded — conda-index will use cached metadata
-    and never open the package files themselves."""
     import sqlite3
     db_path = os.path.join(subdir_path, ".cache", "cache.db")
     if not os.path.exists(db_path):
@@ -235,8 +307,6 @@ def _cached_filenames(subdir_path: str) -> set[str]:
 
 
 def _download_subdir(prefix: str, subdir_path: str, skip: set[str] | None = None) -> int:
-    """Download existing packages that conda-index actually needs on disk.
-    Returns the number of packages downloaded."""
     skip = (skip or set()) | _cached_filenames(subdir_path)
     paginator = s3.get_paginator("list_objects_v2")
     n = 0
@@ -251,11 +321,6 @@ def _download_subdir(prefix: str, subdir_path: str, skip: set[str] | None = None
 
 
 def _download_cache(prefix: str, subdir_path: str) -> None:
-    """Pull down conda-index's own sqlite cache (<subdir>/.cache/cache.db)
-    from a previous run, if one exists. Without this, conda-index has no
-    memory of which packages it already extracted metadata from, and
-    re-extracts everything every single invocation — its incremental
-    indexing only works if this survives between runs."""
     cache_prefix = f"{prefix}.cache/"
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=BUCKET, Prefix=cache_prefix):
@@ -269,8 +334,6 @@ def _download_cache(prefix: str, subdir_path: str) -> None:
 
 
 def _upload_cache(prefix: str, subdir_path: str) -> None:
-    """Push conda-index's updated cache back to R2 so the next invocation
-    (a fresh container, fresh tempdir) can pick up where this one left off."""
     local_cache_dir = os.path.join(subdir_path, ".cache")
     if not os.path.isdir(local_cache_dir):
         return
@@ -283,14 +346,6 @@ def _upload_cache(prefix: str, subdir_path: str) -> None:
 
 
 def _run_conda_index(channel_root: str, subdir: str) -> None:
-    # Community-standard repodata generation — same tool conda-build /
-    # anaconda.org use, so output stays byte-compatible with any client.
-    # Cache is on by default; --no-update-cache would disable the very
-    # thing we're persisting, so don't pass it.
-    # --write-shards additionally produces CEP-16 sharded repodata
-    # (repodata_shards.msgpack.zst + one content-addressed shard per
-    # package). --write-monolithic stays on (the default) so clients that
-    # don't support shards still get a plain repodata.json.
     subprocess.run(
         ["python", "-m", "conda_index", channel_root, "--subdir", subdir, "--write-shards"],
         check=True,
@@ -298,35 +353,17 @@ def _run_conda_index(channel_root: str, subdir: str) -> None:
 
 
 def _upload_shards(subdir_path: str, prefix: str) -> None:
-    """Upload individual shard files (<sha256>.msgpack.zst). conda-index writes
-    these directly into the subdir alongside repodata.json — NOT in a shards/
-    subdirectory. Content-addressed by hash, so re-uploading is idempotent.
-    Must happen before _upload_repodata so readers never see a shard index
-    referencing a shard that isn't in R2 yet."""
     for fname in os.listdir(subdir_path):
-        # Shard files are named <64-char hex sha256>.msgpack.zst
-        # repodata_shards.msgpack.zst is the index and is handled by _upload_repodata
         if fname.endswith(".msgpack.zst") and not fname.startswith("repodata"):
             local_path = os.path.join(subdir_path, fname)
             if os.path.isfile(local_path):
                 s3.upload_file(
-                    local_path,
-                    BUCKET,
-                    f"{prefix}{fname}",
+                    local_path, BUCKET, f"{prefix}{fname}",
                     ExtraArgs={"CacheControl": "public, max-age=31536000, immutable"},
                 )
 
 
 def _upload_repodata(subdir_path: str, prefix: str) -> None:
-    # Files conda clients actually consume:
-    #   repodata.json                     — monolithic package index
-    #   repodata_shards.msgpack.zst       — CEP-16 shard index
-    #   patch_instructions.json           — repodata patches (hotfixes etc.)
-    #
-    # Intentionally skipped (not read by clients):
-    #   index.html                        — human-browsable listing
-    #   repodata_from_packages.json       — raw pre-patch repodata
-    #   repodata_shards_from_packages.*   — raw pre-patch shard source
     UPLOAD_NAMES = {"repodata.json", "repodata_shards.msgpack.zst",
                     "patch_instructions.json", "index.html"}
     for fname in os.listdir(subdir_path):
@@ -334,15 +371,79 @@ def _upload_repodata(subdir_path: str, prefix: str) -> None:
             s3.upload_file(os.path.join(subdir_path, fname), BUCKET, f"{prefix}{fname}")
 
 
+def rebuild_index_and_repodata(channel: str, subdir: str) -> dict:
+    """
+    Tier 2 + Tier 3, assembled FROM shards (not raw packages).
+      Tier 2: rebuild the shard index by reading every name pointer.
+      Tier 3: assemble repodata.json by unpacking every current shard.
+    No package bytes are read. Runs in the SubdirIndexMerger DO's debounced alarm.
+    """
+    t0 = time.time()
+    prefix = f"{channel}/{subdir}"
+    log("rebuild.start", channel=channel, subdir=subdir)
+
+    # Read all name -> hash pointers.
+    name_to_hash: dict[str, str] = {}
+    paginator = s3.get_paginator("list_objects_v2")
+    ptr_prefix = f"{prefix}/_shardptr/"
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=ptr_prefix):
+        for obj in page.get("Contents", []):
+            name = obj["Key"][len(ptr_prefix):]
+            if not name:
+                continue
+            h = s3.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read().decode().strip()
+            name_to_hash[name] = h
+
+    # Tier 2: shard index maps name -> raw sha256 bytes of the shard.
+    shards_map = {name: bytes.fromhex(h) for name, h in name_to_hash.items()}
+    index = {
+        "version": 1,
+        "info": {"base_url": "", "shards_base_url": "", "subdir": subdir,
+                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+        "shards": shards_map,
+    }
+    index_compressed = _ZSTD_C.compress(msgpack.packb(index, use_bin_type=True))
+    s3.put_object(Bucket=BUCKET, Key=f"{prefix}/repodata_shards.msgpack.zst",
+                  Body=index_compressed, CacheControl="public, max-age=300")
+
+    # Tier 3: assemble repodata.json from the shards.
+    packages: dict[str, dict] = {}
+    packages_conda: dict[str, dict] = {}
+    for name, h in name_to_hash.items():
+        try:
+            shard_obj = s3.get_object(Bucket=BUCKET, Key=f"{prefix}/{h}.msgpack.zst")
+        except botocore.exceptions.ClientError:
+            continue
+        shard = _unpack_shard(shard_obj["Body"].read())
+        packages.update(shard.get("packages", {}))
+        packages_conda.update(shard.get("packages.conda", {}))
+
+    repodata = {
+        "info": {"subdir": subdir},
+        "packages": packages,
+        "packages.conda": packages_conda,
+        "repodata_version": 2,
+    }
+    s3.put_object(Bucket=BUCKET, Key=f"{prefix}/repodata.json",
+                  Body=json.dumps(repodata).encode(),
+                  CacheControl="public, max-age=300",
+                  ContentType="application/json")
+
+    log("rebuild.done", channel=channel, subdir=subdir, n_names=len(name_to_hash),
+        n_packages=len(packages) + len(packages_conda),
+        elapsed_s=round(time.time() - t0, 3))
+    return {"n_names": len(name_to_hash),
+            "n_packages": len(packages) + len(packages_conda)}
+
+
 def reindex(channel: str, subdir: str) -> None:
-    """Standalone reindex with no new package to place."""
+    """Full reindex via conda-index — used for deletions and reconciliation only."""
     t0 = time.time()
     log("reindex.start", channel=channel, subdir=subdir)
     with tempfile.TemporaryDirectory() as tmp:
         channel_root = os.path.join(tmp, "channel")
         subdir_path = os.path.join(channel_root, subdir)
         os.makedirs(subdir_path, exist_ok=True)
-
         prefix = f"{channel}/{subdir}/"
         _download_cache(prefix, subdir_path)
         n = _download_subdir(prefix, subdir_path)
@@ -354,25 +455,55 @@ def reindex(channel: str, subdir: str) -> None:
         n_downloaded=n, elapsed_s=round(time.time() - t0, 3))
 
 
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("content-length", 0))
         payload = json.loads(self.rfile.read(length) or b"{}")
 
-        if self.path == "/ingest-batch":
+        if self.path == "/ingest-package":
             channel = payload.get("channel")
-            files = payload.get("files")
-            if not channel or not files:
-                self._respond(400, b"missing channel or files")
+            filename = payload.get("filename")
+            staging_key = payload.get("staging_key")
+            if not channel or not filename or not staging_key:
+                self._respond(400, b"missing channel, filename, or staging_key")
                 return
-            results = ingest_batch(channel, files)
-            # 200 even with some per-file errors inside `results` — the caller
-            # (ChannelQueue.alarm) inspects `results` itself to decide what to
-            # retry. A non-2xx here means the whole call is retried from
-            # scratch, which per-file idempotency already handles safely, but
-            # per-file granularity avoids unnecessary repeated conda-index runs
-            # for subdirs that already succeeded.
-            self._respond(200, json.dumps({"results": results}).encode())
+            try:
+                result = ingest_package(channel, filename, staging_key)
+                self._respond(200, json.dumps(result).encode())
+            except Exception as e:  # noqa: BLE001
+                log("ingest_package.error", filename=filename, error=str(e))
+                self._respond(500, json.dumps({"error": str(e)}).encode())
+
+        elif self.path == "/rebuild-index":
+            channel = payload.get("channel")
+            subdir = payload.get("subdir")
+            if not channel or not subdir:
+                self._respond(400, b"missing channel or subdir")
+                return
+            try:
+                result = rebuild_index_and_repodata(channel, subdir)
+                self._respond(200, json.dumps(result).encode())
+            except Exception as e:  # noqa: BLE001
+                log("rebuild.error", channel=channel, subdir=subdir, error=str(e))
+                self._respond(500, json.dumps({"error": str(e)}).encode())
+
+        elif self.path == "/extract-metadata":
+            channel = payload.get("channel")
+            filename = payload.get("filename")
+            staging_key = payload.get("staging_key")
+            if not channel or not filename or not staging_key:
+                self._respond(400, b"missing channel, filename, or staging_key")
+                return
+            try:
+                result = extract_metadata(channel, filename, staging_key)
+                self._respond(200, json.dumps(result).encode())
+            except Exception as e:  # noqa: BLE001
+                log("extract_metadata.error", filename=filename, error=str(e))
+                self._respond(500, json.dumps({"error": str(e)}).encode())
 
         elif self.path == "/reindex":
             channel = payload.get("channel")
@@ -394,8 +525,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(400, b"missing channel, subdir, or filename")
                 return
             try:
-                key = f"{channel}/{subdir}/{filename}"
-                s3.delete_object(Bucket=BUCKET, Key=key)
+                s3.delete_object(Bucket=BUCKET, Key=f"{channel}/{subdir}/{filename}")
                 reindex(channel, subdir)
                 self._respond(200, json.dumps({"ok": True}).encode())
             except Exception as e:  # noqa: BLE001

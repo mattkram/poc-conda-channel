@@ -6,6 +6,8 @@ export interface Env {
   CHANNEL_BUCKET: R2Bucket;
   INDEXER: DurableObjectNamespace;
   QUEUE: DurableObjectNamespace;
+  INGESTOR: DurableObjectNamespace;
+  MERGER: DurableObjectNamespace;
   GITHUB_CLIENT_ID: string;
   GITHUB_ORG: string;
   UPLOAD_TOKEN_SECRET: string;
@@ -143,52 +145,147 @@ export class ChannelQueue extends DurableObject<Env> {
     const pending = await this.ctx.storage.list<PendingUpload>({ prefix: "pending:" });
     if (pending.size === 0) return;
 
-    const entries = [...pending.entries()]; // already in upload order via key prefix
+    const entries = [...pending.entries()];
     const channel = entries[0][1].channel;
-    const files = entries.map(([, upload]) => ({
-      filename: upload.filename,
-      uploadedAt: upload.uploadedAt,
-      uploadedBy: upload.uploadedBy,
-    }));
 
-    const container = getContainer(this.env.INDEXER, channel);
-    const resp = await container.fetch("http://container/ingest-batch", {
+    // Fan out: one PackageIngestor DO per (channel, filename). Each ingests
+    // its own package independently — no shared state, fully parallel. We key
+    // by filename (not package name) because the name isn't known until the
+    // container extracts index.json. Same-name serialization happens naturally
+    // because each name's shard pointer is last-writer-wins and the merger
+    // reconciles; true same-name races are handled by the ingestor retrying.
+    const settled = await Promise.allSettled(
+      entries.map(async ([key, upload]) => {
+        const id = this.env.INGESTOR.idFromName(`${channel}/${upload.filename}`);
+        const ingestor = this.env.INGESTOR.get(id);
+        const resp = await ingestor.fetch("http://ingestor/ingest", {
+          method: "POST",
+          body: JSON.stringify(upload),
+          headers: { "content-type": "application/json" },
+        });
+        if (!resp.ok) throw new Error(`${upload.filename}: ${await resp.text()}`);
+        await this.ctx.storage.delete(key);
+      })
+    );
+
+    const failed = settled.filter((s) => s.status === "rejected");
+    if (failed.length > 0) {
+      // Leave failed entries queued; DO alarm backoff retries them.
+      await this.ctx.storage.setAlarm(Date.now() + DEBOUNCE_MS);
+      throw new Error(
+        `${failed.length}/${entries.length} ingest(s) failed in ${channel}`
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PackageIngestor — one instance per (channel, filename). Tier 1.
+//
+// Calls the container to extract metadata + write the per-name shard, then
+// notifies the SubdirIndexMerger for that (channel, subdir) that the shard
+// index needs rebuilding. No shared state between different filenames — this
+// is the fully-parallel hot path from the design doc.
+// ---------------------------------------------------------------------------
+export class PackageIngestor extends DurableObject<Env> {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname !== "/ingest" || request.method !== "POST") {
+      return new Response("not found", { status: 404 });
+    }
+    const upload = await request.json<PendingUpload>();
+    const { channel, filename } = upload;
+    const stagingKey = `${channel}/_incoming/${filename}`;
+
+    const container = getContainer(this.env.INDEXER, `${channel}/${filename}`);
+    const resp = await container.fetch("http://container/ingest-package", {
       method: "POST",
-      body: JSON.stringify({ channel, files }),
+      body: JSON.stringify({ channel, filename, staging_key: stagingKey }),
+      headers: { "content-type": "application/json" },
+    });
+    if (!resp.ok) {
+      return new Response(`ingest-package failed: ${await resp.text()}`, { status: 502 });
+    }
+
+    const result = await resp.json<{
+      already_ingested?: boolean;
+      subdir?: string;
+      name?: string;
+    }>();
+
+    if (result.already_ingested) {
+      return new Response("already ingested", { status: 200 });
+    }
+
+    // Notify the per-subdir merger that a shard changed. It debounces and
+    // rebuilds the shard index + repodata.json.
+    const mergerId = this.env.MERGER.idFromName(`${channel}/${result.subdir}`);
+    const merger = this.env.MERGER.get(mergerId);
+    await merger.fetch("http://merger/notify", {
+      method: "POST",
+      body: JSON.stringify({ channel, subdir: result.subdir, name: result.name }),
       headers: { "content-type": "application/json" },
     });
 
-    if (!resp.ok) {
-      // Don't clear anything — leave every entry queued and let the alarm's
-      // own exponential-backoff retry (built into Durable Objects) try again.
-      throw new Error(`ingest-batch failed for ${channel}: ${await resp.text()}`);
-    }
+    return new Response("ingested", { status: 200 });
+  }
+}
 
-    // Container reports per-file outcome so a partial failure only retries
-    // the files that actually failed, not ones already safely ingested.
-    const { results } = await resp.json<{ results: Record<string, "ok" | string> }>();
-    const stillFailing: [string, PendingUpload][] = [];
-    for (const [key, upload] of entries) {
-      if (results[upload.filename] === "ok") {
-        await this.ctx.storage.delete(key);
-      } else {
-        stillFailing.push([key, upload]);
+// ---------------------------------------------------------------------------
+// SubdirIndexMerger — one instance per (channel, subdir). Tier 2 + Tier 3.
+//
+// Receives "a shard changed" notifications from PackageIngestor, debounces
+// them, then asks the container to rebuild the shard index
+// (repodata_shards.msgpack.zst) and assemble repodata.json from shards.
+// Single-writer per subdir, but the file it writes is small — not a
+// throughput bottleneck.
+// ---------------------------------------------------------------------------
+const MERGE_DEBOUNCE_MS = 3_000;
+
+export class SubdirIndexMerger extends DurableObject<Env> {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/notify" && request.method === "POST") {
+      const { channel, subdir } = await request.json<{ channel: string; subdir: string }>();
+      await this.ctx.storage.put("channel", channel);
+      await this.ctx.storage.put("subdir", subdir);
+      await this.ctx.storage.put("dirty", true);
+      const existing = await this.ctx.storage.getAlarm();
+      if (existing === null) {
+        await this.ctx.storage.setAlarm(Date.now() + MERGE_DEBOUNCE_MS);
       }
+      return new Response("noted", { status: 202 });
+    }
+    return new Response("not found", { status: 404 });
+  }
+
+  async alarm(): Promise<void> {
+    const dirty = await this.ctx.storage.get<boolean>("dirty");
+    if (!dirty) return;
+    const channel = await this.ctx.storage.get<string>("channel");
+    const subdir = await this.ctx.storage.get<string>("subdir");
+    if (!channel || !subdir) return;
+
+    // Clear dirty before the rebuild so notifications arriving during the
+    // rebuild re-arm the alarm for another pass.
+    await this.ctx.storage.put("dirty", false);
+
+    const container = getContainer(this.env.INDEXER, `${channel}/${subdir}/_merge`);
+    const resp = await container.fetch("http://container/rebuild-index", {
+      method: "POST",
+      body: JSON.stringify({ channel, subdir }),
+      headers: { "content-type": "application/json" },
+    });
+    if (!resp.ok) {
+      // Rebuild failed — mark dirty again and let alarm backoff retry.
+      await this.ctx.storage.put("dirty", true);
+      throw new Error(`rebuild-index failed for ${channel}/${subdir}: ${await resp.text()}`);
     }
 
-    if (stillFailing.length > 0) {
-      throw new Error(
-        `${stillFailing.length} file(s) still failing in ${channel}: ` +
-          stillFailing.map(([, u]) => u.filename).join(", ")
-      );
-    }
-
-    // More uploads may have arrived while this batch was in flight — if so,
-    // an alarm was never scheduled for them (one was already set), so make
-    // sure they get picked up.
-    const remaining = await this.ctx.storage.list({ prefix: "pending:" });
-    if (remaining.size > 0) {
-      await this.ctx.storage.setAlarm(Date.now() + DEBOUNCE_MS);
+    // If more notifications arrived during the rebuild, schedule another pass.
+    const stillDirty = await this.ctx.storage.get<boolean>("dirty");
+    if (stillDirty) {
+      await this.ctx.storage.setAlarm(Date.now() + MERGE_DEBOUNCE_MS);
     }
   }
 }
