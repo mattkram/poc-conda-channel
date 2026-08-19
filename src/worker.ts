@@ -1137,21 +1137,31 @@ async function handleAbortMultipart(request: Request, env: Env): Promise<Respons
   const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
   if (!claims) return new Response("unauthorized", { status: 401 });
 
+  const body = await request.json<{ debug?: boolean }>().catch(() => ({}));
+
   const client = r2Client(env);
   const bucketUrl = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET_NAME}`;
 
   // List multipart uploads
   const listReq = await client.sign(
-    new Request(`${bucketUrl}?uploads`, { method: "GET" })
+    new Request(`${bucketUrl}?uploads&max-uploads=1000`, { method: "GET" })
   );
   const listResp = await fetch(listReq);
   const listXml = await listResp.text();
 
-  // Parse upload IDs and keys from XML
+  if (body.debug) {
+    return new Response(listXml, { headers: { "content-type": "text/xml" } });
+  }
+
+  // Parse upload IDs and keys from XML — R2 emits <UploadId> before <Key>
   const uploads: Array<{ key: string; uploadId: string }> = [];
-  const keyMatches = listXml.matchAll(/<Key>([^<]+)<\/Key>\s*<UploadId>([^<]+)<\/UploadId>/g);
-  for (const m of keyMatches) {
-    uploads.push({ key: m[1], uploadId: m[2] });
+  const uploadBlocks = listXml.matchAll(/<Upload>([\s\S]*?)<\/Upload>/g);
+  for (const block of uploadBlocks) {
+    const keyMatch = block[1].match(/<Key>([^<]+)<\/Key>/);
+    const idMatch  = block[1].match(/<UploadId>([^<]+)<\/UploadId>/);
+    if (keyMatch && idMatch) {
+      uploads.push({ key: keyMatch[1], uploadId: idMatch[1] });
+    }
   }
 
   // Abort each one
