@@ -440,6 +440,38 @@ export default {
       return handleReconcile(request, reconcileMatch[1], env);
     }
 
+    // POST /internal/migrate-r2-prefix — copy R2 objects from one prefix to another.
+    // Body: { src: "anaconda-cloud", dst: "mattkram/anaconda-cloud", cursor?: string }
+    // Returns: { copied, deleted, errors, done, next_cursor? }
+    // Runs in batches of 20; call repeatedly with next_cursor until done=true.
+    if (url.pathname === "/internal/migrate-r2-prefix" && request.method === "POST") {
+      return handleMigrateR2Prefix(request, env);
+    }
+
+    // POST /internal/delete-r2-prefix — bulk-delete all R2 objects under a prefix.
+    // Body: { prefix: "main/" }  (trailing slash included or not — we normalise)
+    // Returns: { deleted, done, next_cursor? }
+    if (url.pathname === "/internal/delete-r2-prefix" && request.method === "POST") {
+      return handleDeleteR2Prefix(request, env);
+    }
+
+    // --- Legacy redirects: flat channel names → namespaced ---
+    // Handles /channels/anaconda-cloud*, /repo/anaconda-cloud*, /channel/anaconda-cloud*
+    const legacyRedirects: Record<string, string> = {
+      "anaconda-cloud":   "mattkram/anaconda-cloud",
+      "anaconda-cloud-2": "mattkram/anaconda-cloud-2",
+    };
+    for (const [flat, namespaced] of Object.entries(legacyRedirects)) {
+      const flatRe = new RegExp(`^(\/channels\/|\/repo\/|\/channel\/)${flat}(\\/|$)`);
+      if (flatRe.test(url.pathname)) {
+        const newPath = url.pathname.replace(`/${flat}/`, `/${namespaced}/`)
+                                    .replace(`/${flat}`, `/${namespaced}`);
+        const newUrl = new URL(request.url);
+        newUrl.pathname = newPath;
+        return Response.redirect(newUrl.toString(), 301);
+      }
+    }
+
     return new Response("not found", { status: 404 });
   },
 };
@@ -935,6 +967,95 @@ async function handleReconcile(request: Request, channel: string, env: Env): Pro
   } while (cursor);
 
   return Response.json({ channel, upserted, errors });
+}
+
+// POST /internal/migrate-r2-prefix
+// Copies R2 objects from one prefix to another in batches of 100, then deletes
+// the originals. Call repeatedly with the returned next_cursor until done=true.
+async function handleMigrateR2Prefix(request: Request, env: Env): Promise<Response> {
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
+  if (!claims) return new Response("unauthorized", { status: 401 });
+
+  const body = await request.json<{ src: string; dst: string; cursor?: string }>();
+  const { src, dst, cursor } = body;
+  if (!src || !dst) return new Response("missing src or dst", { status: 400 });
+  if (src === dst) return new Response("src and dst must differ", { status: 400 });
+
+  const BATCH = 20;
+  const srcPrefix = src.endsWith("/") ? src : src + "/";
+  const dstPrefix = dst.endsWith("/") ? dst : dst + "/";
+
+  const list = await env.CHANNEL_BUCKET.list({ prefix: srcPrefix, cursor, limit: BATCH });
+
+  let copied = 0, deleted = 0, errors = 0;
+
+  // Sequential to stay within CPU time limits — each object can be megabytes.
+  for (const obj of list.objects) {
+    const srcKey = obj.key;
+    const dstKey = dstPrefix + srcKey.slice(srcPrefix.length);
+    try {
+      const srcObj = await env.CHANNEL_BUCKET.get(srcKey);
+      if (!srcObj) { errors++; continue; }
+      const body = await srcObj.arrayBuffer();
+      await env.CHANNEL_BUCKET.put(dstKey, body, {
+        httpMetadata: srcObj.httpMetadata,
+        customMetadata: srcObj.customMetadata,
+      });
+      copied++;
+      await env.CHANNEL_BUCKET.delete(srcKey);
+      deleted++;
+    } catch {
+      errors++;
+    }
+  }
+
+  const done = !list.truncated;
+  return Response.json({
+    copied, deleted, errors, done,
+    ...(done ? {} : { next_cursor: list.cursor }),
+  });
+}
+
+// POST /internal/delete-r2-prefix
+// Bulk-deletes all R2 objects under an arbitrary prefix in batches of 100.
+// Accepts any prefix string — not restricted to CHANNEL_NAME_RE.
+// Body: { prefix: "main" | "main/" | "__count_only__/" | "_channels-index.json" }
+async function handleDeleteR2Prefix(request: Request, env: Env): Promise<Response> {
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
+  if (!claims) return new Response("unauthorized", { status: 401 });
+
+  const body = await request.json<{ prefix: string; cursor?: string }>();
+  let { prefix, cursor } = body;
+  if (!prefix) return new Response("missing prefix", { status: 400 });
+
+  // Single-object delete (no trailing slash needed)
+  if (!prefix.endsWith("/") && !prefix.includes("/")) {
+    // Could be a single key like "_channels-index.json"
+  }
+  // Normalise: ensure trailing slash for directory-style prefixes unless it
+  // looks like an exact key (contains a dot in the last segment).
+  const isExactKey = !prefix.endsWith("/") && /\.[a-z0-9]+$/i.test(prefix.split("/").pop() ?? "");
+  const listPrefix = isExactKey ? prefix : (prefix.endsWith("/") ? prefix : prefix + "/");
+
+  const list = await env.CHANNEL_BUCKET.list({ prefix: listPrefix, cursor, limit: 100 });
+
+  // Also catch the exact key itself
+  const toDelete = isExactKey
+    ? [prefix]
+    : list.objects.map(o => o.key);
+
+  await Promise.all(toDelete.map(k => env.CHANNEL_BUCKET.delete(k)));
+
+  const done = isExactKey || !list.truncated;
+  return Response.json({
+    deleted: toDelete.length,
+    done,
+    ...(done ? {} : { next_cursor: list.cursor }),
+  });
 }
 
 async function handleRebuildBrowse(request: Request, channel: string, env: Env): Promise<Response> {
