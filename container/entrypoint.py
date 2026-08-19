@@ -470,6 +470,8 @@ def rebuild_index_and_repodata(channel: str, subdir: str) -> dict:
 
     # Rebuild the per-channel browse index from all _browse/ records.
     _rebuild_browse_index(channel)
+    # Ensure this channel is registered in the global channels index.
+    _register_channel(channel)
 
     log("rebuild.done", channel=channel, subdir=subdir, n_names=len(name_to_hash),
         n_packages=len(packages) + len(packages_conda),
@@ -502,6 +504,86 @@ def _rebuild_browse_index(channel: str) -> None:
                   ContentType="application/json")
     log("browse_index.done", channel=channel, n=len(records),
         elapsed_s=round(time.time() - t0, 3))
+
+
+def rebuild_browse_from_repodata(channel: str) -> dict:
+    """
+    Backfill/reconcile browse records for a channel from its existing
+    repodata.json files (across all subdirs). Base fields (name, version,
+    license, subdirs) come from repodata; summary/home stay empty unless a
+    later per-package ingest fills them. Regenerates every _browse/<name>.json
+    and then the aggregated browse-index.json.
+    """
+    t0 = time.time()
+    log("rebuild_browse.start", channel=channel)
+
+    # Discover subdirs via delimiter listing.
+    subdirs = set()
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=f"{channel}/", Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            sd = cp["Prefix"][len(channel) + 1:].rstrip("/")
+            if sd and not sd.startswith("_") and not sd.startswith("browse"):
+                subdirs.add(sd)
+
+    # name -> {version, license, subdirs}, keeping the highest version seen.
+    recs: dict[str, dict] = {}
+    for subdir in subdirs:
+        try:
+            obj = s3.get_object(Bucket=BUCKET, Key=f"{channel}/{subdir}/repodata.json")
+        except botocore.exceptions.ClientError:
+            continue
+        rd = json.loads(obj["Body"].read())
+        allpkgs = {**rd.get("packages", {}), **rd.get("packages.conda", {})}
+        for meta in allpkgs.values():
+            name = meta.get("name")
+            if not name:
+                continue
+            r = recs.setdefault(name, {"name": name, "version": "", "summary": "",
+                                       "license": "", "home": "", "subdirs": set()})
+            r["subdirs"].add(subdir)
+            v = meta.get("version", "")
+            if v > r["version"]:
+                r["version"] = v
+                r["license"] = meta.get("license", "") or r["license"]
+
+    # Write per-name records (preserving any existing summary/home).
+    for name, r in recs.items():
+        r["subdirs"] = sorted(r["subdirs"])
+        browse_key = f"{channel}/_browse/{name}.json"
+        try:
+            prev = json.loads(s3.get_object(Bucket=BUCKET, Key=browse_key)["Body"].read())
+            r["summary"] = r["summary"] or prev.get("summary", "")
+            r["home"] = r["home"] or prev.get("home", "")
+        except botocore.exceptions.ClientError:
+            pass
+        s3.put_object(Bucket=BUCKET, Key=browse_key,
+                      Body=json.dumps(r).encode(), ContentType="application/json")
+
+    _rebuild_browse_index(channel)
+    log("rebuild_browse.done", channel=channel, n_names=len(recs),
+        n_subdirs=len(subdirs), elapsed_s=round(time.time() - t0, 3))
+    return {"n_names": len(recs), "n_subdirs": len(subdirs)}
+
+
+def _register_channel(channel: str) -> None:
+    """Add this channel to the global _channels-index.json (list of names).
+    Read-modify-write; the merge is serialized enough in practice (rare vs.
+    per-package writes) that last-writer-wins is acceptable — a missed add is
+    repaired on the channel's next rebuild."""
+    key = "_channels-index.json"
+    names = set()
+    try:
+        existing = json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+        names = set(existing.get("channels", []))
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+            raise
+    if channel not in names:
+        names.add(channel)
+        s3.put_object(Bucket=BUCKET, Key=key,
+                      Body=json.dumps({"channels": sorted(names)}).encode(),
+                      ContentType="application/json")
 
 
 def reindex(channel: str, subdir: str) -> None:
@@ -557,6 +639,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(200, json.dumps(result).encode())
             except Exception as e:  # noqa: BLE001
                 log("rebuild.error", channel=channel, subdir=subdir, error=str(e))
+                self._respond(500, json.dumps({"error": str(e)}).encode())
+
+        elif self.path == "/rebuild-browse":
+            channel = payload.get("channel")
+            if not channel:
+                self._respond(400, b"missing channel")
+                return
+            try:
+                result = rebuild_browse_from_repodata(channel)
+                self._respond(200, json.dumps(result).encode())
+            except Exception as e:  # noqa: BLE001
+                log("rebuild_browse.error", channel=channel, error=str(e))
                 self._respond(500, json.dumps({"error": str(e)}).encode())
 
         elif self.path == "/extract-metadata":

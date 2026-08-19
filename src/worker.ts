@@ -294,6 +294,11 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // Homepage → channels listing.
+    if (url.pathname === "/" && request.method === "GET") {
+      return Response.redirect(new URL("/channels", url).toString(), 302);
+    }
+
     if (url.pathname === "/auth/device/start" && request.method === "POST") {
       return startDeviceFlow(env);
     }
@@ -307,49 +312,51 @@ export default {
       return handleUploadComplete(request, env);
     }
 
-    // --- Browse UI (must precede the generic read route) ---
-    // GET /<channel>/browse/results?q=&sort=&page=  — htmx HTML fragment
-    const browseResultsMatch = url.pathname.match(/^\/([^/]+)\/browse\/results\/?$/);
-    if (browseResultsMatch && request.method === "GET") {
-      return handleBrowseResults(request, browseResultsMatch[1], url, env);
+    // --- UI pages under /channels ---
+    if (url.pathname === "/channels" || url.pathname === "/channels/") {
+      return handleChannelsIndex(request, env);
     }
-    // GET /<channel>/browse/package/<name>  — package detail page
-    const browsePkgMatch = url.pathname.match(/^\/([^/]+)\/browse\/package\/([^/]+)\/?$/);
-    if (browsePkgMatch && request.method === "GET") {
-      return handleBrowsePackage(request, browsePkgMatch[1], browsePkgMatch[2], env);
+    const resultsMatch = url.pathname.match(/^\/channels\/([^/]+)\/results\/?$/);
+    if (resultsMatch && request.method === "GET") {
+      return handleBrowseResults(request, resultsMatch[1], url, env);
     }
-    // GET /<channel>/browse  — full browse page
-    const browseMatch = url.pathname.match(/^\/([^/]+)\/browse\/?$/);
-    if (browseMatch && request.method === "GET") {
-      return handleBrowsePage(request, browseMatch[1], url, env);
+    const detailMatch = url.pathname.match(/^\/channels\/([^/]+)\/package\/([^/]+)\/?$/);
+    if (detailMatch && request.method === "GET") {
+      return handleBrowsePackage(request, detailMatch[1], detailMatch[2], env);
     }
-
-    // GET /<channel>/<subdir>/<path> — read path for conda clients.
-    // Public channels: no auth. Private channels: Bearer token required.
-    const readMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/.+$/);
-    if (readMatch && request.method === "GET") {
-      return handleR2Get(request, readMatch[1], url.pathname.slice(1), env);
+    const browsePageMatch = url.pathname.match(/^\/channels\/([^/]+)\/?$/);
+    if (browsePageMatch && request.method === "GET") {
+      return handleBrowsePage(request, browsePageMatch[1], url, env);
     }
 
-    // GET /<channel>/<subdir>  or  GET /<channel>/<subdir>/  — subdir index
-    const subdirMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/?$/);
-    if (subdirMatch && request.method === "GET") {
-      return handleR2Get(request, subdirMatch[1], `${subdirMatch[1]}/${subdirMatch[2]}/index.html`, env);
+    // --- conda client read path under /repo ---
+    // GET /repo/<channel>/<subdir>/  or  /repo/<channel>/<subdir>  — subdir index
+    const repoSubdirMatch = url.pathname.match(/^\/repo\/([^/]+)\/([^/]+)\/?$/);
+    if (repoSubdirMatch && request.method === "GET") {
+      return handleR2Get(request, repoSubdirMatch[1],
+        `${repoSubdirMatch[1]}/${repoSubdirMatch[2]}/index.html`, env);
     }
-
-    // GET /<channel>  or  GET /<channel>/  — channel root listing
-    const channelRootMatch = url.pathname.match(/^\/([^/]+)\/?$/);
-    if (channelRootMatch && request.method === "GET"
-        && !url.pathname.startsWith("/channel/")
-        && !url.pathname.startsWith("/auth/")
-        && !url.pathname.startsWith("/upload/")) {
-      return handleChannelRoot(request, channelRootMatch[1], env);
+    // GET /repo/<channel>/<subdir>/<path> — repodata, shards, packages
+    const repoReadMatch = url.pathname.match(/^\/repo\/([^/]+)\/([^/]+)\/.+$/);
+    if (repoReadMatch && request.method === "GET") {
+      return handleR2Get(request, repoReadMatch[1], url.pathname.slice("/repo/".length), env);
+    }
+    // GET /repo/<channel>  or  /repo/<channel>/ — channel root listing
+    const repoRootMatch = url.pathname.match(/^\/repo\/([^/]+)\/?$/);
+    if (repoRootMatch && request.method === "GET") {
+      return handleChannelRoot(request, repoRootMatch[1], env);
     }
 
     // DELETE /channel/<channel>/<subdir>/<filename> — remove one package + reindex
     const pkgMatch = url.pathname.match(/^\/channel\/([^/]+)\/([^/]+)\/([^/]+)$/);
     if (pkgMatch && request.method === "DELETE") {
       return handleDeletePackage(request, pkgMatch[1], pkgMatch[2], pkgMatch[3], env);
+    }
+
+    // POST /channel/<channel>/rebuild-browse — backfill browse data (owner)
+    const rebuildBrowseMatch = url.pathname.match(/^\/channel\/([^/]+)\/rebuild-browse$/);
+    if (rebuildBrowseMatch && request.method === "POST") {
+      return handleRebuildBrowse(request, rebuildBrowseMatch[1], env);
     }
 
     // GET  /channel/<channel>         — return owner + visibility
@@ -543,7 +550,7 @@ function renderResults(channel: string, records: BrowseRecord[], q: string, sort
   const rows = slice.length
     ? slice.map((r) => `
       <div class="pkg">
-        <a class="name" href="/${channel}/browse/package/${encodeURIComponent(r.name)}">${esc(r.name)}</a>
+        <a class="name" href="/channels/${channel}/package/${encodeURIComponent(r.name)}">${esc(r.name)}</a>
         <span class="ver">${esc(r.version)}</span>
         ${r.summary ? `<div class="summary">${esc(r.summary)}</div>` : ""}
         <div class="meta">
@@ -556,9 +563,9 @@ function renderResults(channel: string, records: BrowseRecord[], q: string, sort
   const qs = (p: number) => `?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&page=${p}`;
   const pager = pages > 1 ? `
     <div class="pager">
-      ${cur > 1 ? `<a hx-get="/${channel}/browse/results${qs(cur - 1)}" hx-target="#results">&lsaquo; Prev</a>` : ""}
+      ${cur > 1 ? `<a hx-get="/channels/${channel}/results${qs(cur - 1)}" hx-target="#results">&lsaquo; Prev</a>` : ""}
       <span class="cur">${cur} / ${pages}</span>
-      ${cur < pages ? `<a hx-get="/${channel}/browse/results${qs(cur + 1)}" hx-target="#results">Next &rsaquo;</a>` : ""}
+      ${cur < pages ? `<a hx-get="/channels/${channel}/results${qs(cur + 1)}" hx-target="#results">Next &rsaquo;</a>` : ""}
     </div>` : "";
 
   return `<div class="count">${total} package${total === 1 ? "" : "s"}</div>${rows}${pager}`;
@@ -570,6 +577,74 @@ async function browseAuth(request: Request, channel: string, env: Env): Promise<
   const token = auth.replace(/^Bearer\s+/i, "");
   const claims = token ? await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET) : null;
   return checkReadAccess(channel, claims?.login ?? null, env);
+}
+
+// GET /channels — parent page listing all channels (names from
+// _channels-index.json, visibility from each channel's ChannelQueue DO).
+async function handleChannelsIndex(request: Request, env: Env): Promise<Response> {
+  const obj = await env.CHANNEL_BUCKET.get("_channels-index.json");
+  const names: string[] = obj ? ((await obj.json<{ channels: string[] }>()).channels ?? []) : [];
+
+  const cards = await Promise.all(
+    names.map(async (name) => {
+      let visibility = "public";
+      let owner: string | null = null;
+      try {
+        const q = env.QUEUE.get(env.QUEUE.idFromName(name));
+        const info = await (await q.fetch("http://queue/owner")).json<{ owner: string | null; visibility: string }>();
+        visibility = info.visibility;
+        owner = info.owner;
+      } catch { /* default public */ }
+      const lock = visibility === "private" ? ' <span class="badge" style="background:#fdecea;color:#b42318">private</span>' : "";
+      return `
+      <div class="pkg">
+        <a class="name" href="/channels/${name}">${esc(name)}</a>${lock}
+        <div class="meta">${owner ? `<span>owner: ${esc(owner)}</span>` : ""}<span>conda channel</span></div>
+      </div>`;
+    })
+  );
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Channels</title>
+<style>${BROWSE_CSS}</style>
+</head>
+<body>
+<header><a class="brand" href="/channels">conda-channel-server</a><span class="chan">channels</span></header>
+<div class="wrap">
+  <div class="count">${names.length} channel${names.length === 1 ? "" : "s"}</div>
+  ${cards.join("") || `<div class="empty">No channels yet.</div>`}
+</div>
+</body>
+</html>`;
+  return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
+}
+
+// POST /channel/<channel>/rebuild-browse — backfill browse data (owner only).
+async function handleRebuildBrowse(request: Request, channel: string, env: Env): Promise<Response> {
+  if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
+  if (!claims) return new Response("unauthorized", { status: 401 });
+  const denied = await checkChannelAccess(channel, claims.login, env);
+  if (denied) return denied;
+
+  const container = getContainer(env.INDEXER, `${channel}/_rebuild-browse`);
+  const resp = await container.fetch("http://container/rebuild-browse", {
+    method: "POST",
+    body: JSON.stringify({ channel }),
+    headers: { "content-type": "application/json" },
+  });
+  if (!resp.ok) {
+    return new Response(`rebuild-browse failed: ${await resp.text()}`, { status: 502 });
+  }
+  return new Response(await resp.text(), {
+    status: 200, headers: { "content-type": "application/json" },
+  });
 }
 
 async function handleBrowseResults(request: Request, channel: string, url: URL, env: Env): Promise<Response> {
@@ -604,11 +679,11 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
 </head>
 <body>
 <header>
-  <a class="brand" href="/${channel}/browse">${esc(channel)}</a>
-  <span class="chan">conda channel</span>
+  <a class="brand" href="/channels">conda-channel-server</a>
+  <span class="chan">/ ${esc(channel)}</span>
 </header>
 <div class="wrap">
-  <form class="controls" hx-get="/${channel}/browse/results" hx-target="#results" hx-trigger="input changed delay:250ms from:input[name='q'], change from:select">
+  <form class="controls" hx-get="/channels/${channel}/results" hx-target="#results" hx-trigger="input changed delay:250ms from:input[name='q'], change from:select">
     <input type="search" name="q" placeholder="Search packages&hellip;" value="${esc(q)}" autocomplete="off">
     <select name="sort">
       <option value="name-asc"${sort === "name-asc" ? " selected" : ""}>Name A&rarr;Z</option>
@@ -645,7 +720,7 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
 
   const buildRows = builds.map((b) => `
     <div class="pkg">
-      <a class="name" href="/${channel}/${b.subdir}/${encodeURIComponent(b.filename)}">${esc(b.filename)}</a>
+      <a class="name" href="/repo/${channel}/${b.subdir}/${encodeURIComponent(b.filename)}">${esc(b.filename)}</a>
       <div class="meta"><span class="badge">${esc(b.subdir)}</span><span>v${esc(b.version)}</span><span>${esc(b.build)}</span></div>
     </div>`).join("");
 
@@ -660,8 +735,8 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
 </head>
 <body>
 <header>
-  <a class="brand" href="/${channel}/browse">${esc(channel)}</a>
-  <span class="chan">/ ${esc(name)}</span>
+  <a class="brand" href="/channels">conda-channel-server</a>
+  <span class="chan">/ <a href="/channels/${channel}" style="color:#616e7c">${esc(channel)}</a> / ${esc(name)}</span>
 </header>
 <div class="wrap">
   <h1 style="margin:0 0 4px">${esc(name)} <span class="ver">${esc(rec.version)}</span></h1>
@@ -670,7 +745,7 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
     ${rec.license ? `<span>License: ${esc(rec.license)}</span>` : ""}
     ${rec.home ? `<span><a href="${esc(rec.home)}">${esc(rec.home)}</a></span>` : ""}
   </div>
-  <p><strong>Install:</strong> <code>conda install -c ${esc(origin)}/${esc(channel)} ${esc(name)}</code></p>
+  <p><strong>Install:</strong> <code>conda install -c ${esc(origin)}/repo/${esc(channel)} ${esc(name)}</code></p>
   <h2 style="font-size:16px;margin-top:24px">Files</h2>
   ${buildRows || `<div class="empty">No files.</div>`}
 </div>

@@ -154,7 +154,7 @@ def main() -> None:
 
     # Fetch source and destination repodata in parallel
     source_repodata = fetch_repodata(SOURCE_REPODATA, "source (pkgs/main)")
-    dest_url = f"{args.worker_url.rstrip('/')}/{args.channel}/noarch/repodata.json"
+    dest_url = f"{args.worker_url.rstrip('/')}/repo/{args.channel}/noarch/repodata.json"
     dest_repodata = fetch_repodata(dest_url, f"destination ({args.channel})")
 
     already = len(all_filenames(dest_repodata))
