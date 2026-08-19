@@ -535,24 +535,25 @@ const BROWSE_CSS = `
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #1f2933; background: #f5f7fa; }
   header { background: #fff; border-bottom: 1px solid #e4e7eb; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
-  header .brand { font-weight: 700; font-size: 18px; color: #43b02a; text-decoration: none; }
-  header .chan { color: #616e7c; font-size: 14px; }
+  header .brand { font-weight: 700; font-size: 18px; color: #2d7a1f; text-decoration: none; }
+  header .chan { color: #3d4f5c; font-size: 14px; }
   .wrap { max-width: 960px; margin: 0 auto; padding: 24px; }
-  .controls { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+  .controls { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
+  .controls label.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
   .controls input[type=search] { flex: 1 1 320px; padding: 10px 14px; border: 1px solid #cbd2d9; border-radius: 6px; font-size: 15px; }
   .controls select { padding: 10px 12px; border: 1px solid #cbd2d9; border-radius: 6px; font-size: 14px; background: #fff; }
-  .count { color: #616e7c; font-size: 13px; margin-bottom: 12px; }
+  .count { color: #3d4f5c; font-size: 13px; margin-bottom: 12px; }
   .pkg { background: #fff; border: 1px solid #e4e7eb; border-radius: 8px; padding: 16px 18px; margin-bottom: 10px; }
-  .pkg:hover { border-color: #43b02a; }
+  .pkg:hover { border-color: #2d7a1f; }
   .pkg a.name { font-size: 16px; font-weight: 600; color: #1f6f18; text-decoration: none; }
-  .pkg .ver { color: #9aa5b1; font-size: 13px; margin-left: 8px; }
-  .pkg .summary { color: #52606d; font-size: 14px; margin: 6px 0 8px; }
-  .pkg .meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: #7b8794; }
-  .pkg .badge { background: #eef7ec; color: #2f8f1c; border-radius: 4px; padding: 2px 8px; font-size: 12px; }
+  .pkg .ver { color: #52606d; font-size: 13px; margin-left: 8px; }
+  .pkg .summary { color: #3d4f5c; font-size: 14px; margin: 6px 0 8px; }
+  .pkg .meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: #3d4f5c; }
+  .pkg .badge { background: #c8eac2; color: #1a5c12; border-radius: 4px; padding: 2px 8px; font-size: 12px; }
   .pager { display: flex; gap: 8px; align-items: center; margin-top: 20px; }
   .pager a, .pager span { padding: 6px 12px; border: 1px solid #cbd2d9; border-radius: 6px; text-decoration: none; color: #1f2933; font-size: 14px; cursor: pointer; }
-  .pager .cur { background: #43b02a; color: #fff; border-color: #43b02a; }
-  .empty { color: #7b8794; padding: 40px; text-align: center; }
+  .pager .cur { background: #2d7a1f; color: #fff; border-color: #2d7a1f; }
+  .empty { color: #3d4f5c; padding: 40px; text-align: center; }
   code { background: #f0f2f5; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
 `;
 
@@ -605,9 +606,9 @@ function renderResults(channel: string, records: BrowseRecord[], q: string, sort
   const qs = (p: number) => `?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&page=${p}`;
   const pager = pages > 1 ? `
     <div class="pager">
-      ${cur > 1 ? `<a hx-get="/channels/${channel}/results${qs(cur - 1)}" hx-target="#results">&lsaquo; Prev</a>` : ""}
+      ${cur > 1 ? `<a href="/channels/${channel}${qs(cur - 1)}" hx-get="/channels/${channel}/results${qs(cur - 1)}" hx-target="#results">&lsaquo; Prev</a>` : ""}
       <span class="cur">${cur} / ${pages}</span>
-      ${cur < pages ? `<a hx-get="/channels/${channel}/results${qs(cur + 1)}" hx-target="#results">Next &rsaquo;</a>` : ""}
+      ${cur < pages ? `<a href="/channels/${channel}${qs(cur + 1)}" hx-get="/channels/${channel}/results${qs(cur + 1)}" hx-target="#results">Next &rsaquo;</a>` : ""}
     </div>` : "";
 
   return `<div class="count">${total} package${total === 1 ? "" : "s"}</div>${rows}${pager}`;
@@ -651,15 +652,18 @@ async function handleChannelsIndex(request: Request, env: Env): Promise<Response
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Channels</title>
+<meta name="description" content="Browse all conda channels hosted on this server.">
+<title>Channels &middot; conda-channel-server</title>
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
 <header><a class="brand" href="/channels">conda-channel-server</a><span class="chan">channels</span></header>
+<main>
 <div class="wrap">
   <div class="count">${names.length} channel${names.length === 1 ? "" : "s"}</div>
   ${cards.join("") || `<div class="empty">No channels yet.</div>`}
 </div>
+</main>
 </body>
 </html>`;
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
@@ -715,6 +719,7 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Browse packages in the ${esc(channel)} conda channel. Search, filter, and install packages.">
 <title>${esc(channel)} &middot; packages</title>
 <script src="https://unpkg.com/htmx.org@1.9.12"></script>
 <style>${BROWSE_CSS}</style>
@@ -724,16 +729,20 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
   <a class="brand" href="/channels">conda-channel-server</a>
   <span class="chan">/ ${esc(channel)}</span>
 </header>
+<main>
 <div class="wrap">
   <form class="controls" hx-get="/channels/${channel}/results" hx-target="#results" hx-trigger="input changed delay:250ms from:input[name='q'], change from:select">
-    <input type="search" name="q" placeholder="Search packages&hellip;" value="${esc(q)}" autocomplete="off">
-    <select name="sort">
+    <label class="sr-only" for="pkg-search">Search packages</label>
+    <input id="pkg-search" type="search" name="q" placeholder="Search packages&hellip;" value="${esc(q)}" autocomplete="off">
+    <label class="sr-only" for="pkg-sort">Sort by</label>
+    <select id="pkg-sort" name="sort" aria-label="Sort packages">
       <option value="name-asc"${sort === "name-asc" ? " selected" : ""}>Name A&rarr;Z</option>
       <option value="name-desc"${sort === "name-desc" ? " selected" : ""}>Name Z&rarr;A</option>
     </select>
   </form>
   <div id="results">${results}</div>
 </div>
+</main>
 </body>
 </html>`;
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
@@ -772,14 +781,16 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="${esc(rec.summary || `${name} package in the ${channel} conda channel`)}">
 <title>${esc(name)} &middot; ${esc(channel)}</title>
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
 <header>
   <a class="brand" href="/channels">conda-channel-server</a>
-  <span class="chan">/ <a href="/channels/${channel}" style="color:#616e7c">${esc(channel)}</a> / ${esc(name)}</span>
+  <span class="chan">/ <a href="/channels/${channel}" style="color:#3d4f5c">${esc(channel)}</a> / ${esc(name)}</span>
 </header>
+<main>
 <div class="wrap">
   <h1 style="margin:0 0 4px">${esc(name)} <span class="ver">${esc(rec.version)}</span></h1>
   ${rec.summary ? `<p class="summary">${esc(rec.summary)}</p>` : ""}
@@ -791,6 +802,7 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
   <h2 style="font-size:16px;margin-top:24px">Files</h2>
   ${buildRows || `<div class="empty">No files.</div>`}
 </div>
+</main>
 </body>
 </html>`;
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
