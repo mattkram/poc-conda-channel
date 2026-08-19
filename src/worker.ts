@@ -361,45 +361,56 @@ export default {
     if (url.pathname === "/channels" || url.pathname === "/channels/") {
       return handleChannelsIndex(request, env);
     }
-    const resultsMatch = url.pathname.match(/^\/channels\/([^/]+)\/results\/?$/);
+    // Channel name may be namespaced (owner/name) — capture up to one slash.
+    const resultsMatch = url.pathname.match(/^\/channels\/([^/]+(?:\/[^/]+)?)\/results\/?$/);
     if (resultsMatch && request.method === "GET") {
       return handleBrowseResults(request, resultsMatch[1], url, env);
     }
-    const detailMatch = url.pathname.match(/^\/channels\/([^/]+)\/package\/([^/]+)\/?$/);
+    const detailMatch = url.pathname.match(/^\/channels\/([^/]+(?:\/[^/]+)?)\/package\/([^/]+)\/?$/);
     if (detailMatch && request.method === "GET") {
       return handleBrowsePackage(request, detailMatch[1], detailMatch[2], env);
     }
-    const browsePageMatch = url.pathname.match(/^\/channels\/([^/]+)\/?$/);
+    const browsePageMatch = url.pathname.match(/^\/channels\/([^/]+(?:\/[^/]+)?)\/?$/);
     if (browsePageMatch && request.method === "GET") {
-      return handleBrowsePage(request, browsePageMatch[1], url, env);
+      const seg = browsePageMatch[1];
+      // Single-segment path could be a namespace — check D1 for owner/name channels.
+      if (!seg.includes("/")) {
+        const nsChannels = await env.DB.prepare(
+          `SELECT name, owner, visibility FROM channels WHERE name LIKE ? OR name = ? ORDER BY name`
+        ).bind(`${seg}/%`, seg).all<{ name: string; owner: string | null; visibility: string }>();
+        if (nsChannels.results.some(r => r.name.startsWith(`${seg}/`))) {
+          return handleNamespacePage(seg, nsChannels.results);
+        }
+      }
+      return handleBrowsePage(request, seg, url, env);
     }
 
     // --- conda client read path under /repo ---
     // GET /repo/<channel>/<subdir>/  or  /repo/<channel>/<subdir>  — subdir index
-    const repoSubdirMatch = url.pathname.match(/^\/repo\/([^/]+)\/([^/]+)\/?$/);
+    const repoSubdirMatch = url.pathname.match(/^\/repo\/([^/]+(?:\/[^/]+)?)\/([^/]+)\/?$/);
     if (repoSubdirMatch && request.method === "GET") {
       return handleR2Get(request, repoSubdirMatch[1],
         `${repoSubdirMatch[1]}/${repoSubdirMatch[2]}/index.html`, env);
     }
     // GET /repo/<channel>/<subdir>/<path> — repodata, shards, packages
-    const repoReadMatch = url.pathname.match(/^\/repo\/([^/]+)\/([^/]+)\/.+$/);
+    const repoReadMatch = url.pathname.match(/^\/repo\/([^/]+(?:\/[^/]+)?)\/([^/]+)\/.+$/);
     if (repoReadMatch && request.method === "GET") {
       return handleR2Get(request, repoReadMatch[1], url.pathname.slice("/repo/".length), env);
     }
     // GET /repo/<channel>  or  /repo/<channel>/ — channel root listing
-    const repoRootMatch = url.pathname.match(/^\/repo\/([^/]+)\/?$/);
+    const repoRootMatch = url.pathname.match(/^\/repo\/([^/]+(?:\/[^/]+)?)\/?$/);
     if (repoRootMatch && request.method === "GET") {
       return handleChannelRoot(request, repoRootMatch[1], env);
     }
 
     // DELETE /channel/<channel>/<subdir>/<filename> — remove one package + reindex
-    const pkgMatch = url.pathname.match(/^\/channel\/([^/]+)\/([^/]+)\/([^/]+)$/);
+    const pkgMatch = url.pathname.match(/^\/channel\/([^/]+(?:\/[^/]+)?)\/([^/]+)\/([^/]+)$/);
     if (pkgMatch && request.method === "DELETE") {
       return handleDeletePackage(request, pkgMatch[1], pkgMatch[2], pkgMatch[3], env);
     }
 
     // POST /channel/<channel>/rebuild-browse — backfill browse data (owner)
-    const rebuildBrowseMatch = url.pathname.match(/^\/channel\/([^/]+)\/rebuild-browse$/);
+    const rebuildBrowseMatch = url.pathname.match(/^\/channel\/([^/]+(?:\/[^/]+)?)\/rebuild-browse$/);
     if (rebuildBrowseMatch && request.method === "POST") {
       return handleRebuildBrowse(request, rebuildBrowseMatch[1], env);
     }
@@ -407,14 +418,14 @@ export default {
     // GET  /channel/<channel>         — return owner + visibility
     // POST /channel/<channel>/visibility — set public/private (owner only)
     // DELETE /channel/<channel>       — wipe entire channel
-    const chanMatch = url.pathname.match(/^\/channel\/([^/]+)$/);
+    const chanMatch = url.pathname.match(/^\/channel\/([^/]+(?:\/[^/]+)?)$/);
     if (chanMatch && request.method === "GET") {
       return handleGetChannelInfo(chanMatch[1], env);
     }
     if (chanMatch && request.method === "DELETE") {
       return handleDeleteChannel(request, chanMatch[1], env);
     }
-    const visMatch = url.pathname.match(/^\/channel\/([^/]+)\/visibility$/);
+    const visMatch = url.pathname.match(/^\/channel\/([^/]+(?:\/[^/]+)?)\/visibility$/);
     if (visMatch && request.method === "POST") {
       return handleSetVisibility(request, visMatch[1], env);
     }
@@ -424,7 +435,7 @@ export default {
       return handleUpsertPackage(request, env);
     }
     // POST /internal/reconcile/<channel> — rebuild D1 from R2 _browse/* objects.
-    const reconcileMatch = url.pathname.match(/^\/internal\/reconcile\/([^/]+)$/);
+    const reconcileMatch = url.pathname.match(/^\/internal\/reconcile\/([^/]+(?:\/[^/]+)?)$/);
     if (reconcileMatch && request.method === "POST") {
       return handleReconcile(request, reconcileMatch[1], env);
     }
@@ -459,9 +470,19 @@ async function ensureChannelRow(channel: string, owner: string, env: Env): Promi
 }
 
 // Claim-or-verify write access. Returns a 403 Response on denial, null on ok.
-// On first upload to a channel, claims it for this login and creates the D1 row.
+// For namespaced channels (e.g. "mattkram/main"), the namespace must match
+// the uploader's login — you cannot upload to someone else's namespace.
 async function checkChannelAccess(channel: string, login: string, env: Env): Promise<Response | null> {
-  // Fast D1 check first — if the row already exists, validate ownership there.
+  // Enforce namespace ownership up-front — no DO round-trip needed.
+  const ns = channelNamespace(channel);
+  if (ns && ns !== login) {
+    return new Response(
+      `channel '${channel}' belongs to namespace '${ns}' — you are '${login}'`,
+      { status: 403 }
+    );
+  }
+
+  // Fast D1 check — if the row exists, validate ownership there.
   const row = await env.DB.prepare(
     `SELECT owner FROM channels WHERE name = ?`
   ).bind(channel).first<{ owner: string | null }>();
@@ -473,12 +494,10 @@ async function checkChannelAccess(channel: string, login: string, env: Env): Pro
         { status: 403 }
       );
     }
-    // Owner matches (or null — channel exists but unclaimed, shouldn't happen).
     return null;
   }
 
-  // Channel not in D1 yet — fall through to DO for atomic first-claim, then
-  // mirror the result to D1.
+  // Channel not in D1 yet — fall through to DO for atomic first-claim.
   const queueId = env.QUEUE.idFromName(channel);
   const queue = env.QUEUE.get(queueId);
   const resp = await queue.fetch("http://queue/claim", {
@@ -493,7 +512,6 @@ async function checkChannelAccess(channel: string, login: string, env: Env): Pro
       { status: 403 }
     );
   }
-  // Claim succeeded — write to D1 so future checks skip the DO.
   await ensureChannelRow(channel, login, env);
   return null;
 }
@@ -614,9 +632,12 @@ const PAGE_SIZE = 25;
 const BROWSE_CSS = `
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #1f2933; background: #f5f7fa; }
-  header { background: #fff; border-bottom: 1px solid #e4e7eb; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+  header { background: #fff; border-bottom: 1px solid #e4e7eb; padding: 16px 24px; display: flex; align-items: center; gap: 8px; }
   header .brand { font-weight: 700; font-size: 18px; color: #2d7a1f; text-decoration: none; }
-  header .chan { color: #3d4f5c; font-size: 14px; }
+  header .chan-ns { color: #2d7a1f; font-size: 14px; font-weight: 600; text-decoration: none; }
+  header .chan-ns:hover { text-decoration: underline; }
+  header .chan-sep { color: #9aacb8; font-size: 14px; padding: 0 2px; }
+  header .chan { color: #3d4f5c; font-size: 14px; font-weight: 600; }
   .wrap { max-width: 960px; margin: 0 auto; padding: 24px; }
   .controls { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
   .controls label.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
@@ -731,9 +752,13 @@ async function handleChannelsIndex(request: Request, env: Env): Promise<Response
     const lock = ch.visibility === "private"
       ? ' <span class="badge" style="background:#fdecea;color:#b42318">private</span>'
       : "";
+    const ns = channelNamespace(ch.name);
+    const displayName = ns
+      ? `<span style="color:#9aacb8">${esc(ns)}/</span>${esc(ch.name.slice(ns.length + 1))}`
+      : esc(ch.name);
     return `
       <div class="pkg">
-        <a class="name" href="/channels/${ch.name}">${esc(ch.name)}</a>${lock}
+        <a class="name" href="/channels/${ch.name}">${displayName}</a>${lock}
         <div class="meta">${ch.owner ? `<span>owner: ${esc(ch.owner)}</span>` : ""}<span>conda channel</span></div>
       </div>`;
   });
@@ -753,6 +778,48 @@ async function handleChannelsIndex(request: Request, env: Env): Promise<Response
 <div class="wrap">
   <div class="count">${results.length} channel${results.length === 1 ? "" : "s"}</div>
   ${cards.join("") || `<div class="empty">No channels yet.</div>`}
+</div>
+</main>
+</body>
+</html>`;
+  return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
+}
+
+// GET /channels/:namespace — list all channels in a namespace.
+function handleNamespacePage(
+  namespace: string,
+  channels: Array<{ name: string; owner: string | null; visibility: string }>
+): Response {
+  const nsChannels = channels.filter(ch => ch.name.startsWith(`${namespace}/`));
+  const cards = nsChannels.map((ch) => {
+    const short = ch.name.slice(namespace.length + 1);
+    const lock = ch.visibility === "private"
+      ? ' <span class="badge" style="background:#fdecea;color:#b42318">private</span>'
+      : "";
+    return `
+      <div class="pkg">
+        <a class="name" href="/channels/${ch.name}">${esc(short)}</a>${lock}
+        <div class="meta"><span>conda channel</span></div>
+      </div>`;
+  });
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Channels owned by ${esc(namespace)}.">
+<title>${esc(namespace)} &middot; channels</title>
+<style>${BROWSE_CSS}</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="/channels">conda-channel-server</a>
+  <span class="chan">${esc(namespace)}</span>
+</header>
+<main>
+<div class="wrap">
+  <div class="count">${nsChannels.length} channel${nsChannels.length === 1 ? "" : "s"}</div>
+  ${cards.join("") || `<div class="empty">No channels in this namespace.</div>`}
 </div>
 </main>
 </body>
@@ -927,6 +994,11 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
   const records = await loadBrowseIndex(channel, env, q, sort);
   const results = renderResults(channel, records, q, sort, page);
 
+  const ns = channelNamespace(channel);
+  const channelHeader = ns
+    ? `<a class="chan-ns" href="/channels/${esc(ns)}">${esc(ns)}</a><span class="chan-sep">/</span><span class="chan">${esc(channel.slice(ns.length + 1))}</span>`
+    : `<span class="chan">${esc(channel)}</span>`;
+
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -940,7 +1012,7 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
 <body>
 <header>
   <a class="brand" href="/channels">conda-channel-server</a>
-  <span class="chan">/ ${esc(channel)}</span>
+  ${channelHeader}
 </header>
 <main>
 <div class="wrap">
@@ -1145,8 +1217,17 @@ async function handleDeleteChannel(request: Request, channel: string, env: Env):
 //                          to the container (which is the only thing that
 //                          ever reads the package bytes, because it has to).
 // ---------------------------------------------------------------------------
-const CHANNEL_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+// Bare channel name (e.g. "main") or namespaced (e.g. "mattkram/main").
+// Namespace: valid GitHub username (alphanumeric + hyphens, ≤39 chars).
+const CHANNEL_NAME_RE = /^(?:[a-z0-9][a-z0-9-]{0,38}\/)?[a-z0-9][a-z0-9._-]{0,63}$/;
 const PRESIGN_TTL_SECONDS = 900; // 15 min — plenty for a package upload, short-lived if leaked
+
+// Extract the namespace from a channel name, or null if none.
+// "mattkram/main" → "mattkram";  "main" → null
+function channelNamespace(channel: string): string | null {
+  const slash = channel.indexOf("/");
+  return slash === -1 ? null : channel.slice(0, slash);
+}
 
 function r2Client(env: Env): AwsClient {
   return new AwsClient({
