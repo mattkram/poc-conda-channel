@@ -180,10 +180,11 @@ class ChannelClient:
         pkg_path: pathlib.Path,
         token: str,
         progress: bool = True,
-    ) -> str:
+    ) -> tuple[str, dict]:
         """
         Upload a single package file to a channel.
-        Returns the filename on success, raises ChannelError on failure.
+        Returns (filename, timing) where timing = {init_s, put_s, complete_s, ul_s}.
+        Raises ChannelError on failure.
         """
         filename = pkg_path.name
         size_kb = pkg_path.stat().st_size // 1024
@@ -192,25 +193,38 @@ class ChannelClient:
             print(f"  {filename} ({size_kb}kB) ... ", end="", flush=True)
 
         # 1. Get presigned PUT URL
+        t0 = time.time()
         status, data = _api("POST", f"{self.worker_url}/upload/init",
                              {"channel": channel, "filename": filename}, token=token)
         if status != 200:
             raise ChannelError(f"upload/init failed ({status}): {data}")
+        t_init = time.time() - t0
 
         # 2. PUT bytes directly to R2
+        t0 = time.time()
         put_status = _put_file(data["upload_url"], pkg_path)
         if put_status not in (200, 204):
             raise ChannelError(f"PUT to R2 failed ({put_status})")
+        t_put = time.time() - t0
 
         # 3. Notify Worker that the upload landed
+        t0 = time.time()
         status, data = _api("POST", f"{self.worker_url}/upload/complete",
                              {"channel": channel, "filename": filename}, token=token)
         if status != 202:
             raise ChannelError(f"upload/complete failed ({status}): {data}")
+        t_complete = time.time() - t0
+
+        timing = {
+            "init_s":     round(t_init, 3),
+            "put_s":      round(t_put, 3),
+            "complete_s": round(t_complete, 3),
+            "ul_s":       round(t_init + t_put + t_complete, 3),
+        }
 
         if progress:
-            print("queued.")
-        return filename
+            print(f"queued.  init={t_init:.2f}s  put={t_put:.2f}s  complete={t_complete:.2f}s")
+        return filename, timing
 
     # ------------------------------------------------------------------
     # Delete

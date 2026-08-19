@@ -159,7 +159,7 @@ def cmd_upload(args, client: ChannelClient) -> None:
     errors = []
     for pkg in paths:
         try:
-            fname = client.upload(args.channel, pkg, token)
+            fname, _ = client.upload(args.channel, pkg, token)
             uploaded.append(fname)
         except ChannelError as e:
             print(f"  ERROR: {e}", file=sys.stderr)

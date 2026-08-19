@@ -16,19 +16,27 @@ Usage:
 
 Performance flags:
   --workers N    Parallel upload threads (default: 8)
+  --dl-workers N Parallel download threads (default: same as --workers)
   --no-wait      Don't poll repodata after upload (fire-and-forget)
   --all-versions Include every version/build, not just latest per name
   --subdirs      Space-separated list of subdirs to mirror (default: noarch)
   --source URL   Source channel base URL (default: https://repo.anaconda.com/pkgs/main)
+
+Architecture:
+  Download and upload run in separate thread pools connected by a queue so
+  downloads overlap with in-flight uploads. Each phase is timed independently
+  and reported in the stats output.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import pathlib
+import queue
 import random
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +47,7 @@ from channel_client import ChannelClient, ChannelError, DEFAULT_WORKER_URL
 
 DEFAULT_SOURCE  = "https://repo.anaconda.com/pkgs/main"
 POLL_TIMEOUT    = 300
+_SENTINEL = object()
 
 
 def fetch_repodata(url: str, label: str) -> dict:
@@ -112,36 +121,30 @@ def pick_packages(source_repodata: dict, dest_repodata: dict,
     return candidates[:count]
 
 
-def download_package(meta: dict, dest_dir: pathlib.Path, source_base: str, subdir: str) -> pathlib.Path:
+def download_package(meta: dict, dest_dir: pathlib.Path,
+                     source_base: str, subdir: str) -> tuple[pathlib.Path, float]:
+    """Download one package. Returns (local_path, elapsed_s)."""
     filename = meta["filename"]
     url = f"{source_base.rstrip('/')}/{subdir}/{filename}"
     dest = dest_dir / filename
-    if dest.exists():
-        return dest
-    req = urllib.request.Request(url, headers={"user-agent": "conda-mirror/1.0"})
-    with urllib.request.urlopen(req) as resp:
-        dest.write_bytes(resp.read())
-    return dest
+    t0 = time.time()
+    if not dest.exists():
+        req = urllib.request.Request(url, headers={"user-agent": "conda-mirror/1.0"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            dest.write_bytes(resp.read())
+    return dest, time.time() - t0
 
 
 def upload_one(
     client: ChannelClient,
     channel: str,
     token: str,
-    meta: dict,
-    dest_dir: pathlib.Path,
-    source_base: str,
-    subdir: str,
-) -> tuple[str, float, str | None]:
-    """Download then upload one package. Returns (filename, elapsed_s, error|None)."""
-    filename = meta["filename"]
-    t0 = time.time()
-    try:
-        pkg_path = download_package(meta, dest_dir, source_base, subdir)
-        client.upload(channel, pkg_path, token, progress=False)
-        return filename, time.time() - t0, None
-    except Exception as e:
-        return filename, time.time() - t0, str(e)
+    pkg_path: pathlib.Path,
+) -> tuple[float, float, float]:
+    """Upload one already-downloaded package.
+    Returns (init_s, put_s, complete_s)."""
+    _, timing = client.upload(channel, pkg_path, token, progress=False)
+    return timing["init_s"], timing["put_s"], timing["complete_s"]
 
 
 def main() -> None:
@@ -157,6 +160,8 @@ def main() -> None:
                         help="Mirror every version/build, not just latest per name")
     parser.add_argument("--workers", "-w", type=int, default=8,
                         help="Parallel upload threads (default: 8)")
+    parser.add_argument("--dl-workers", type=int, default=None,
+                        help="Parallel download threads (default: same as --workers)")
     parser.add_argument("--worker-url", default=DEFAULT_WORKER_URL, metavar="URL")
     parser.add_argument("--reauth", action="store_true", help="Force re-authentication")
     parser.add_argument("--no-wait", action="store_true", help="Skip repodata polling after upload")
@@ -166,6 +171,7 @@ def main() -> None:
                         help="Write per-package upload stats to a JSON file")
     args = parser.parse_args()
 
+    dl_workers = args.dl_workers or args.workers
     source_base = args.source.rstrip("/")
     client = ChannelClient(worker_url=args.worker_url)
 
@@ -195,48 +201,132 @@ def main() -> None:
 
     total_bytes = sum(m.get("size", 0) for m, _ in all_selected)
     print(f"\nTotal: {len(all_selected)} packages, {total_bytes/1024/1024:.1f} MB")
-    print(f"Uploading to '{args.channel}' with {args.workers} parallel workers\n")
+    print(f"Uploading to '{args.channel}' with {args.workers} upload / {dl_workers} download workers\n")
+
+    # Per-package results: {filename: {dl_s, init_s, put_s, complete_s, ul_s, error}}
+    pkg_results: dict[str, dict] = {}
+    results_lock = threading.Lock()
+    done_count = 0
+    error_count = 0
+    n_total = len(all_selected)
+    width = len(str(n_total))
+
+    # Pipeline: download pool feeds a bounded queue; upload pool drains it.
+    # Queue capacity = 2× upload workers so downloads stay ahead without
+    # buffering the entire dataset on disk.
+    ready_queue: queue.Queue = queue.Queue(maxsize=args.workers * 2)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         dest_dir = pathlib.Path(tmpdir)
         t_start = time.time()
-        results: list[tuple[str, float, str | None]] = []
-        done = 0
-        errors = 0
 
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {
-                pool.submit(upload_one, client, args.channel, token, meta,
-                            dest_dir, source_base, subdir): (meta, subdir)
-                for meta, subdir in all_selected
-            }
-            for future in as_completed(futures):
-                filename, elapsed, error = future.result()
-                meta, subdir = futures[future]
-                done += 1
+        def download_worker(meta: dict, subdir: str) -> None:
+            filename = meta["filename"]
+            try:
+                path, dl_s = download_package(meta, dest_dir, source_base, subdir)
+                ready_queue.put((meta, subdir, path, dl_s, None))
+            except Exception as e:
+                ready_queue.put((meta, subdir, None, 0.0, str(e)))
+
+        def upload_worker() -> None:
+            nonlocal done_count, error_count
+            while True:
+                item = ready_queue.get()
+                if item is _SENTINEL:
+                    ready_queue.put(_SENTINEL)  # re-enqueue for other upload workers
+                    break
+                meta, subdir, path, dl_s, dl_err = item
+                filename = meta["filename"]
+
+                if dl_err:
+                    init_s = put_s = complete_s = ul_s = 0.0
+                    error = f"download failed: {dl_err}"
+                else:
+                    try:
+                        init_s, put_s, complete_s = upload_one(client, args.channel, token, path)
+                        ul_s = init_s + put_s + complete_s
+                        error = None
+                    except Exception as e:
+                        init_s = put_s = complete_s = ul_s = 0.0
+                        error = str(e)
+
+                with results_lock:
+                    done_count += 1
+                    if error:
+                        error_count += 1
+                    pkg_results[filename] = {
+                        "dl_s":       round(dl_s, 3),
+                        "init_s":     round(init_s, 3),
+                        "put_s":      round(put_s, 3),
+                        "complete_s": round(complete_s, 3),
+                        "ul_s":       round(ul_s, 3),
+                        "error":      error,
+                    }
+                    dc = done_count
+
+                size_kb = meta.get("size", 0) // 1024
                 if error:
-                    errors += 1
                     status = f"ERROR: {error}"
                 else:
-                    size_kb = meta.get("size", 0) // 1024
-                    status = f"{size_kb}kB in {elapsed:.1f}s"
-                print(f"  [{done:>{len(str(len(all_selected)))}}/{len(all_selected)}] {filename}  {status}")
-                results.append((filename, elapsed, error))
+                    status = f"{size_kb}kB  dl={dl_s:.1f}s  init={init_s:.1f}s  put={put_s:.1f}s  complete={complete_s:.1f}s"
+                print(f"  [{dc:>{width}}/{n_total}] {filename}  {status}")
+
+        # Start upload workers first (they'll block on the queue).
+        upload_threads = [
+            threading.Thread(target=upload_worker, daemon=True)
+            for _ in range(args.workers)
+        ]
+        for t in upload_threads:
+            t.start()
+
+        # Run downloads in a thread pool, feeding the queue.
+        with ThreadPoolExecutor(max_workers=dl_workers) as dl_pool:
+            dl_futures = [
+                dl_pool.submit(download_worker, meta, subdir)
+                for meta, subdir in all_selected
+            ]
+            for f in as_completed(dl_futures):
+                f.result()  # surface exceptions if any
+
+        # Signal upload workers that downloads are done.
+        ready_queue.put(_SENTINEL)
+        for t in upload_threads:
+            t.join()
 
         wall = time.time() - t_start
-        ok_count = len(all_selected) - errors
-        errored = {r[0] for r in results if r[2]}
-        ok_bytes = sum(m.get("size", 0) for m, _ in all_selected if m["filename"] not in errored)
+        ok_count = n_total - error_count
+        errored = {fn for fn, r in pkg_results.items() if r["error"]}
+        ok_bytes = sum(
+            m.get("size", 0) for m, _ in all_selected
+            if m["filename"] not in errored
+        )
+
+        # Aggregate timing
+        ok_results = [r for r in pkg_results.values() if not r["error"]]
+        dl_times    = [r["dl_s"]       for r in ok_results]
+        init_times  = [r["init_s"]     for r in ok_results]
+        put_times   = [r["put_s"]      for r in ok_results]
+        comp_times  = [r["complete_s"] for r in ok_results]
+        ul_times    = [r["ul_s"]       for r in ok_results]
+
+        def avg(xs): return sum(xs)/len(xs) if xs else 0
 
         print(f"\n{'='*60}")
-        print(f"Uploaded {ok_count}/{len(all_selected)} packages in {wall:.1f}s")
+        print(f"Uploaded {ok_count}/{n_total} packages in {wall:.1f}s wall time")
         if wall > 0:
             print(f"Throughput: {ok_bytes/1024/1024/wall:.2f} MB/s  ({ok_count/wall:.1f} pkgs/s)")
-        if errors:
-            print(f"Errors ({errors}):")
-            for fname, _, err in results:
-                if err:
-                    print(f"  {fname}: {err}")
+        if ok_results:
+            print(f"Avg per package (ok only):")
+            print(f"  download:         {avg(dl_times):.2f}s  (from source)")
+            print(f"  upload/init:      {avg(init_times):.2f}s  (Worker presign)")
+            print(f"  upload/PUT:       {avg(put_times):.2f}s  (bytes → R2)")
+            print(f"  upload/complete:  {avg(comp_times):.2f}s  (Worker enqueue)")
+            print(f"  upload total:     {avg(ul_times):.2f}s")
+        if error_count:
+            print(f"Errors ({error_count}):")
+            for fname, r in pkg_results.items():
+                if r["error"]:
+                    print(f"  {fname}: {r['error']}")
         print(f"{'='*60}\n")
 
         if args.keep:
@@ -251,27 +341,39 @@ def main() -> None:
             fname_to_meta = {m["filename"]: (m, sd) for m, sd in all_selected}
             stats = {
                 "run": {
-                    "channel": args.channel,
-                    "source": source_base,
-                    "subdirs": args.subdirs,
-                    "n_selected": len(all_selected),
-                    "n_ok": ok_count,
-                    "n_err": errors,
-                    "wall_s": round(wall, 3),
-                    "ok_bytes": ok_bytes,
+                    "channel":         args.channel,
+                    "source":          source_base,
+                    "subdirs":         args.subdirs,
+                    "ul_workers":      args.workers,
+                    "dl_workers":      dl_workers,
+                    "n_selected":      n_total,
+                    "n_ok":            ok_count,
+                    "n_err":           error_count,
+                    "wall_s":          round(wall, 3),
+                    "ok_bytes":        ok_bytes,
                     "throughput_mbps": round(ok_bytes/1024/1024/wall, 4) if wall > 0 else 0,
-                    "pkgs_per_s": round(ok_count/wall, 3) if wall > 0 else 0,
-                    "ts": time.time(),
+                    "pkgs_per_s":      round(ok_count/wall, 3) if wall > 0 else 0,
+                    "avg_dl_s":        round(avg(dl_times), 3),
+                    "avg_init_s":      round(avg(init_times), 3),
+                    "avg_put_s":       round(avg(put_times), 3),
+                    "avg_complete_s":  round(avg(comp_times), 3),
+                    "avg_ul_s":        round(avg(ul_times), 3),
+                    "ts":              time.time(),
                 },
                 "packages": [
                     {
-                        "filename": fname,
-                        "subdir": fname_to_meta.get(fname, ({}, ""))[1],
+                        "filename":   fname,
+                        "subdir":     fname_to_meta.get(fname, ({}, ""))[1],
                         "size_bytes": fname_to_meta.get(fname, ({}, ""))[0].get("size", 0),
-                        "elapsed_s": round(elapsed, 3),
-                        "error": error,
+                        "dl_s":       r["dl_s"],
+                        "init_s":     r["init_s"],
+                        "put_s":      r["put_s"],
+                        "complete_s": r["complete_s"],
+                        "ul_s":       r["ul_s"],
+                        "elapsed_s":  round(r["dl_s"] + r["ul_s"], 3),
+                        "error":      r["error"],
                     }
-                    for fname, elapsed, error in results
+                    for fname, r in pkg_results.items()
                 ],
             }
             pathlib.Path(args.stats).write_text(json.dumps(stats, indent=2))
@@ -279,7 +381,7 @@ def main() -> None:
 
     # Poll repodata
     if not args.no_wait and ok_count > 0:
-        uploaded_names = [r[0] for r in results if not r[2]]
+        uploaded_names = [fn for fn, r in pkg_results.items() if not r["error"]]
         print(f"Waiting for indexing (up to {POLL_TIMEOUT}s)...")
         t_index = time.time()
         ok = client.poll_repodata(args.channel, uploaded_names, timeout=POLL_TIMEOUT)
