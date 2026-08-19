@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 
-DEFAULT_WORKER_URL = "https://conda-channel-server.matthew-robert-kramer.workers.dev"
+DEFAULT_WORKER_URL = "https://conda.matt-kramer.com"
 DEFAULT_TOKEN_CACHE = pathlib.Path(__file__).parent.parent / ".token-cache"
 
 USER_AGENT = "conda-channel-manager/1.0"
