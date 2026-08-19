@@ -18,10 +18,11 @@ R2_BUCKET_NAME = "conda-channel"
 
 [durable_objects]
 bindings = [
-  { name = "INDEXER",  class_name = "IndexerContainer" },
-  { name = "QUEUE",    class_name = "ChannelQueue" },
-  { name = "INGESTOR", class_name = "PackageIngestor" },
-  { name = "MERGER",   class_name = "SubdirIndexMerger" }
+  { name = "INDEXER",      class_name = "IndexerContainer" },
+  { name = "QUEUE",        class_name = "ChannelQueue" },
+  { name = "INGESTOR",     class_name = "PackageIngestor" },
+  { name = "MERGER",       class_name = "SubdirIndexMerger" },
+  { name = "INGEST_QUEUE", class_name = "ChannelIngestQueue" }
 ]
 
 [[migrations]]
@@ -35,6 +36,10 @@ new_sqlite_classes = ["ChannelQueue"]
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["PackageIngestor", "SubdirIndexMerger"]
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["ChannelIngestQueue"]
 
 [[containers]]
 class_name = "IndexerContainer"

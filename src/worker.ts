@@ -8,6 +8,7 @@ export interface Env {
   QUEUE: DurableObjectNamespace;
   INGESTOR: DurableObjectNamespace;
   MERGER: DurableObjectNamespace;
+  INGEST_QUEUE: DurableObjectNamespace;
   GITHUB_CLIENT_ID: string;
   GITHUB_ORG: string;
   UPLOAD_TOKEN_SECRET: string;
@@ -171,16 +172,10 @@ export class ChannelQueue extends DurableObject<Env> {
 }
 
 // ---------------------------------------------------------------------------
-// PackageIngestor — one instance per (channel, filename). Tier 1.
-//
-// Non-blocking design: /ingest stores the work and arms an alarm, returning
-// 202 immediately. The alarm does the actual container call. This means the
-// number of concurrently running containers is bounded by how many alarms
-// fire at the same instant — naturally limited by Cloudflare's alarm
-// scheduling — not by upload burst volume. No max_instances exhaustion.
+// PackageIngestor — one instance per (channel, filename).
+// Immediately enqueues work into the channel's ChannelIngestQueue and returns.
+// No container call here — the queue owns all container interaction.
 // ---------------------------------------------------------------------------
-const INGEST_RETRY_DELAY_MS = 5_000;
-
 export class PackageIngestor extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -189,27 +184,61 @@ export class PackageIngestor extends DurableObject<Env> {
     }
     const upload = await request.json<PendingUpload>();
 
-    // Store the work and arm the alarm. Return immediately — caller (ChannelQueue
-    // alarm) doesn't block on ingest completion; it just fires and forgets.
-    await this.ctx.storage.put("pending", upload);
-    const existing = await this.ctx.storage.getAlarm();
-    if (existing === null) {
-      await this.ctx.storage.setAlarm(Date.now() + 100); // near-immediate
-    }
+    // Forward to the per-channel ingest queue and return immediately.
+    const queueId = this.env.INGEST_QUEUE.idFromName(upload.channel);
+    const queue = this.env.INGEST_QUEUE.get(queueId);
+    await queue.fetch("http://ingest-queue/enqueue", {
+      method: "POST",
+      body: JSON.stringify(upload),
+      headers: { "content-type": "application/json" },
+    });
     return new Response("queued", { status: 202 });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ChannelIngestQueue — one instance per channel. Tier 1 work queue.
+//
+// Serializes all container /ingest-package calls for a channel so the single
+// Python HTTP server is never overwhelmed. Works like ChannelQueue but for
+// container calls rather than upload notifications:
+//
+//   /enqueue — store work, arm alarm
+//   alarm()  — pop one item, call container, notify merger, arm next alarm
+//
+// Concurrency is exactly 1 container call at a time per channel. The alarm
+// auto-reschedules as long as there is pending work. Failed items are retried
+// via the normal DO alarm backoff.
+// ---------------------------------------------------------------------------
+const INGEST_QUEUE_DRAIN_MS = 100; // near-immediate between items
+
+export class ChannelIngestQueue extends DurableObject<Env> {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/enqueue" && request.method === "POST") {
+      const upload = await request.json<PendingUpload>();
+      // Key by padded timestamp + filename for stable ordering.
+      const key = `work:${String(upload.uploadedAt).padStart(15, "0")}:${upload.filename}`;
+      await this.ctx.storage.put(key, upload);
+      const existing = await this.ctx.storage.getAlarm();
+      if (existing === null) {
+        await this.ctx.storage.setAlarm(Date.now() + INGEST_QUEUE_DRAIN_MS);
+      }
+      return new Response("queued", { status: 202 });
+    }
+    return new Response("not found", { status: 404 });
   }
 
   async alarm(): Promise<void> {
-    const upload = await this.ctx.storage.get<PendingUpload>("pending");
-    if (!upload) return;
-
+    // Pop the oldest item.
+    const list = await this.ctx.storage.list<PendingUpload>({ prefix: "work:", limit: 1 });
+    if (list.size === 0) return;
+    const [[key, upload]] = list.entries();
     const { channel, filename } = upload;
-    const stagingKey = `${channel}/_incoming/${filename}`;
 
-    // One container per channel — all ingestors for the same channel share
-    // the same container instance (it's stateless between requests). This
-    // caps containers at one per active channel, not one per file.
+    // Call the container — one at a time, no overload.
     const container = getContainer(this.env.INDEXER, channel);
+    const stagingKey = `${channel}/_incoming/${filename}`;
     const resp = await container.fetch("http://container/ingest-package", {
       method: "POST",
       body: JSON.stringify({ channel, filename, staging_key: stagingKey }),
@@ -217,28 +246,29 @@ export class PackageIngestor extends DurableObject<Env> {
     });
 
     if (!resp.ok) {
-      // Leave pending in storage; alarm backoff retries automatically.
-      throw new Error(`ingest-package failed for ${filename}: ${await resp.text()}`);
+      // Requeue at back by using a future timestamp so other items drain first.
+      const retryKey = `work:${String(Date.now() + 60_000).padStart(15, "0")}:${filename}`;
+      await this.ctx.storage.put(retryKey, upload);
+      await this.ctx.storage.delete(key);
+    } else {
+      const result = await resp.json<{ already_ingested?: boolean; subdir?: string; name?: string }>();
+      await this.ctx.storage.delete(key);
+
+      if (!result.already_ingested && result.subdir) {
+        const mergerId = this.env.MERGER.idFromName(`${channel}/${result.subdir}`);
+        const merger = this.env.MERGER.get(mergerId);
+        await merger.fetch("http://merger/notify", {
+          method: "POST",
+          body: JSON.stringify({ channel, subdir: result.subdir, name: result.name }),
+          headers: { "content-type": "application/json" },
+        });
+      }
     }
 
-    const result = await resp.json<{
-      already_ingested?: boolean;
-      subdir?: string;
-      name?: string;
-    }>();
-
-    // Clear the pending work — this ingest is done.
-    await this.ctx.storage.delete("pending");
-
-    if (!result.already_ingested && result.subdir) {
-      // Notify the per-subdir merger to rebuild the shard index + repodata.
-      const mergerId = this.env.MERGER.idFromName(`${channel}/${result.subdir}`);
-      const merger = this.env.MERGER.get(mergerId);
-      await merger.fetch("http://merger/notify", {
-        method: "POST",
-        body: JSON.stringify({ channel, subdir: result.subdir, name: result.name }),
-        headers: { "content-type": "application/json" },
-      });
+    // Re-arm if more work remains.
+    const remaining = await this.ctx.storage.list({ prefix: "work:", limit: 1 });
+    if (remaining.size > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + INGEST_QUEUE_DRAIN_MS);
     }
   }
 }
