@@ -307,6 +307,23 @@ export default {
       return handleUploadComplete(request, env);
     }
 
+    // --- Browse UI (must precede the generic read route) ---
+    // GET /<channel>/browse/results?q=&sort=&page=  — htmx HTML fragment
+    const browseResultsMatch = url.pathname.match(/^\/([^/]+)\/browse\/results\/?$/);
+    if (browseResultsMatch && request.method === "GET") {
+      return handleBrowseResults(request, browseResultsMatch[1], url, env);
+    }
+    // GET /<channel>/browse/package/<name>  — package detail page
+    const browsePkgMatch = url.pathname.match(/^\/([^/]+)\/browse\/package\/([^/]+)\/?$/);
+    if (browsePkgMatch && request.method === "GET") {
+      return handleBrowsePackage(request, browsePkgMatch[1], browsePkgMatch[2], env);
+    }
+    // GET /<channel>/browse  — full browse page
+    const browseMatch = url.pathname.match(/^\/([^/]+)\/browse\/?$/);
+    if (browseMatch && request.method === "GET") {
+      return handleBrowsePage(request, browseMatch[1], url, env);
+    }
+
     // GET /<channel>/<subdir>/<path> — read path for conda clients.
     // Public channels: no auth. Private channels: Bearer token required.
     const readMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/.+$/);
@@ -449,6 +466,219 @@ async function handleR2Get(request: Request, channel: string, key: string, env: 
 // Channel root listing — GET /<channel>/ — returns an HTML page listing
 // the subdirs present in the channel (discovered by listing R2 prefixes).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Browse UI — anaconda.org-style package listing, search, sort, pagination.
+// Reads the channel's browse-index.json (built by the container in Tier 2/3),
+// filters/sorts/paginates in the Worker, renders HTML fragments for htmx.
+// ---------------------------------------------------------------------------
+interface BrowseRecord {
+  name: string;
+  version: string;
+  summary: string;
+  license: string;
+  home: string;
+  subdirs: string[];
+}
+
+const PAGE_SIZE = 25;
+
+const BROWSE_CSS = `
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #1f2933; background: #f5f7fa; }
+  header { background: #fff; border-bottom: 1px solid #e4e7eb; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+  header .brand { font-weight: 700; font-size: 18px; color: #43b02a; text-decoration: none; }
+  header .chan { color: #616e7c; font-size: 14px; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 24px; }
+  .controls { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+  .controls input[type=search] { flex: 1 1 320px; padding: 10px 14px; border: 1px solid #cbd2d9; border-radius: 6px; font-size: 15px; }
+  .controls select { padding: 10px 12px; border: 1px solid #cbd2d9; border-radius: 6px; font-size: 14px; background: #fff; }
+  .count { color: #616e7c; font-size: 13px; margin-bottom: 12px; }
+  .pkg { background: #fff; border: 1px solid #e4e7eb; border-radius: 8px; padding: 16px 18px; margin-bottom: 10px; }
+  .pkg:hover { border-color: #43b02a; }
+  .pkg a.name { font-size: 16px; font-weight: 600; color: #1f6f18; text-decoration: none; }
+  .pkg .ver { color: #9aa5b1; font-size: 13px; margin-left: 8px; }
+  .pkg .summary { color: #52606d; font-size: 14px; margin: 6px 0 8px; }
+  .pkg .meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: #7b8794; }
+  .pkg .badge { background: #eef7ec; color: #2f8f1c; border-radius: 4px; padding: 2px 8px; font-size: 12px; }
+  .pager { display: flex; gap: 8px; align-items: center; margin-top: 20px; }
+  .pager a, .pager span { padding: 6px 12px; border: 1px solid #cbd2d9; border-radius: 6px; text-decoration: none; color: #1f2933; font-size: 14px; cursor: pointer; }
+  .pager .cur { background: #43b02a; color: #fff; border-color: #43b02a; }
+  .empty { color: #7b8794; padding: 40px; text-align: center; }
+  code { background: #f0f2f5; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+`;
+
+function esc(s: string): string {
+  return (s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+async function loadBrowseIndex(channel: string, env: Env): Promise<BrowseRecord[]> {
+  const obj = await env.CHANNEL_BUCKET.get(`${channel}/browse-index.json`);
+  if (!obj) return [];
+  const data = await obj.json<{ packages: BrowseRecord[] }>();
+  return data.packages ?? [];
+}
+
+function filterSort(records: BrowseRecord[], q: string, sort: string): BrowseRecord[] {
+  let out = records;
+  if (q) {
+    const needle = q.toLowerCase();
+    out = out.filter(
+      (r) =>
+        r.name.toLowerCase().includes(needle) ||
+        (r.summary ?? "").toLowerCase().includes(needle)
+    );
+  }
+  const sorted = [...out];
+  if (sort === "name-desc") sorted.sort((a, b) => b.name.localeCompare(a.name));
+  else sorted.sort((a, b) => a.name.localeCompare(b.name));
+  return sorted;
+}
+
+function renderResults(channel: string, records: BrowseRecord[], q: string, sort: string, page: number): string {
+  const total = records.length;
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const cur = Math.min(Math.max(1, page), pages);
+  const slice = records.slice((cur - 1) * PAGE_SIZE, cur * PAGE_SIZE);
+
+  const rows = slice.length
+    ? slice.map((r) => `
+      <div class="pkg">
+        <a class="name" href="/${channel}/browse/package/${encodeURIComponent(r.name)}">${esc(r.name)}</a>
+        <span class="ver">${esc(r.version)}</span>
+        ${r.summary ? `<div class="summary">${esc(r.summary)}</div>` : ""}
+        <div class="meta">
+          ${r.license ? `<span>${esc(r.license)}</span>` : ""}
+          ${(r.subdirs ?? []).map((s) => `<span class="badge">${esc(s)}</span>`).join(" ")}
+        </div>
+      </div>`).join("")
+    : `<div class="empty">No packages match &ldquo;${esc(q)}&rdquo;.</div>`;
+
+  const qs = (p: number) => `?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&page=${p}`;
+  const pager = pages > 1 ? `
+    <div class="pager">
+      ${cur > 1 ? `<a hx-get="/${channel}/browse/results${qs(cur - 1)}" hx-target="#results">&lsaquo; Prev</a>` : ""}
+      <span class="cur">${cur} / ${pages}</span>
+      ${cur < pages ? `<a hx-get="/${channel}/browse/results${qs(cur + 1)}" hx-target="#results">Next &rsaquo;</a>` : ""}
+    </div>` : "";
+
+  return `<div class="count">${total} package${total === 1 ? "" : "s"}</div>${rows}${pager}`;
+}
+
+async function browseAuth(request: Request, channel: string, env: Env): Promise<Response | null> {
+  if (!CHANNEL_NAME_RE.test(channel)) return new Response("not found", { status: 404 });
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.replace(/^Bearer\s+/i, "");
+  const claims = token ? await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET) : null;
+  return checkReadAccess(channel, claims?.login ?? null, env);
+}
+
+async function handleBrowseResults(request: Request, channel: string, url: URL, env: Env): Promise<Response> {
+  const denied = await browseAuth(request, channel, env);
+  if (denied) return denied;
+  const q = url.searchParams.get("q") ?? "";
+  const sort = url.searchParams.get("sort") ?? "name-asc";
+  const page = parseInt(url.searchParams.get("page") ?? "1", 10) || 1;
+  const records = filterSort(await loadBrowseIndex(channel, env), q, sort);
+  return new Response(renderResults(channel, records, q, sort, page), {
+    headers: { "content-type": "text/html;charset=utf-8" },
+  });
+}
+
+async function handleBrowsePage(request: Request, channel: string, url: URL, env: Env): Promise<Response> {
+  const denied = await browseAuth(request, channel, env);
+  if (denied) return denied;
+  const q = url.searchParams.get("q") ?? "";
+  const sort = url.searchParams.get("sort") ?? "name-asc";
+  const page = parseInt(url.searchParams.get("page") ?? "1", 10) || 1;
+  const records = filterSort(await loadBrowseIndex(channel, env), q, sort);
+  const results = renderResults(channel, records, q, sort, page);
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(channel)} &middot; packages</title>
+<script src="https://unpkg.com/htmx.org@1.9.12"></script>
+<style>${BROWSE_CSS}</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="/${channel}/browse">${esc(channel)}</a>
+  <span class="chan">conda channel</span>
+</header>
+<div class="wrap">
+  <form class="controls" hx-get="/${channel}/browse/results" hx-target="#results" hx-trigger="input changed delay:250ms from:input[name='q'], change from:select">
+    <input type="search" name="q" placeholder="Search packages&hellip;" value="${esc(q)}" autocomplete="off">
+    <select name="sort">
+      <option value="name-asc"${sort === "name-asc" ? " selected" : ""}>Name A&rarr;Z</option>
+      <option value="name-desc"${sort === "name-desc" ? " selected" : ""}>Name Z&rarr;A</option>
+    </select>
+  </form>
+  <div id="results">${results}</div>
+</div>
+</body>
+</html>`;
+  return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
+}
+
+async function handleBrowsePackage(request: Request, channel: string, name: string, env: Env): Promise<Response> {
+  const denied = await browseAuth(request, channel, env);
+  if (denied) return denied;
+  name = decodeURIComponent(name);
+
+  const rec = (await loadBrowseIndex(channel, env)).find((r) => r.name === name);
+  if (!rec) return new Response("package not found", { status: 404 });
+
+  const builds: { subdir: string; filename: string; version: string; build: string }[] = [];
+  for (const subdir of rec.subdirs ?? []) {
+    const obj = await env.CHANNEL_BUCKET.get(`${channel}/${subdir}/repodata.json`);
+    if (!obj) continue;
+    const rd = await obj.json<{ packages: Record<string, any>; "packages.conda": Record<string, any> }>();
+    for (const [fn, meta] of Object.entries({ ...(rd.packages ?? {}), ...(rd["packages.conda"] ?? {}) })) {
+      if ((meta as any).name === name) {
+        builds.push({ subdir, filename: fn, version: (meta as any).version, build: (meta as any).build });
+      }
+    }
+  }
+  builds.sort((a, b) => b.version.localeCompare(a.version) || a.filename.localeCompare(b.filename));
+
+  const buildRows = builds.map((b) => `
+    <div class="pkg">
+      <a class="name" href="/${channel}/${b.subdir}/${encodeURIComponent(b.filename)}">${esc(b.filename)}</a>
+      <div class="meta"><span class="badge">${esc(b.subdir)}</span><span>v${esc(b.version)}</span><span>${esc(b.build)}</span></div>
+    </div>`).join("");
+
+  const origin = new URL(request.url).origin;
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(name)} &middot; ${esc(channel)}</title>
+<style>${BROWSE_CSS}</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="/${channel}/browse">${esc(channel)}</a>
+  <span class="chan">/ ${esc(name)}</span>
+</header>
+<div class="wrap">
+  <h1 style="margin:0 0 4px">${esc(name)} <span class="ver">${esc(rec.version)}</span></h1>
+  ${rec.summary ? `<p class="summary">${esc(rec.summary)}</p>` : ""}
+  <div class="meta" style="margin-bottom:20px">
+    ${rec.license ? `<span>License: ${esc(rec.license)}</span>` : ""}
+    ${rec.home ? `<span><a href="${esc(rec.home)}">${esc(rec.home)}</a></span>` : ""}
+  </div>
+  <p><strong>Install:</strong> <code>conda install -c ${esc(origin)}/${esc(channel)} ${esc(name)}</code></p>
+  <h2 style="font-size:16px;margin-top:24px">Files</h2>
+  ${buildRows || `<div class="empty">No files.</div>`}
+</div>
+</body>
+</html>`;
+  return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
+}
+
 async function handleChannelRoot(request: Request, channel: string, env: Env): Promise<Response> {
   if (!CHANNEL_NAME_RE.test(channel)) return new Response("not found", { status: 404 });
 

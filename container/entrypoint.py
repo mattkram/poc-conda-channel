@@ -102,20 +102,23 @@ def _object_exists(key: str) -> bool:
 
 
 def _extract_info(pkg_path: str) -> dict:
-    """Extract info/index.json and info/run_exports.json from a package.
-    Works for both .conda (zip of zstd tars) and .tar.bz2."""
+    """Extract info/index.json, info/run_exports.json, info/about.json from a
+    package. Works for both .conda (zip of zstd tars) and .tar.bz2."""
     index_json = None
     run_exports = None
+    about = None
     for tar, member in package_streaming.stream_conda_info(pkg_path):
         if member.name == "info/index.json":
             index_json = json.load(tar.extractfile(member))
         elif member.name == "info/run_exports.json":
             run_exports = json.load(tar.extractfile(member))
-        if index_json is not None and run_exports is not None:
+        elif member.name == "info/about.json":
+            about = json.load(tar.extractfile(member))
+        if index_json is not None and run_exports is not None and about is not None:
             break
     if index_json is None:
         raise ValueError(f"info/index.json not found in {pkg_path}")
-    return index_json, run_exports
+    return index_json, run_exports, about
 
 
 def _compute_checksums(path: str) -> tuple[str, str, int]:
@@ -157,7 +160,7 @@ def extract_metadata(channel: str, filename: str, staging_key: str) -> dict:
             size_bytes=size, elapsed_s=round(dl_time, 3))
 
         t1 = time.time()
-        index_json, run_exports = _extract_info(local_path)
+        index_json, run_exports, about = _extract_info(local_path)
         md5, sha256, _ = _compute_checksums(local_path)
         extract_time = time.time() - t1
         log("extract_metadata.extracted", filename=filename,
@@ -172,6 +175,16 @@ def extract_metadata(channel: str, filename: str, staging_key: str) -> dict:
         if run_exports:
             entry["run_exports"] = run_exports
 
+    # Compact browse record — enough to render a listing row + support search.
+    about = about or {}
+    browse = {
+        "name": index_json.get("name"),
+        "version": index_json.get("version"),
+        "summary": about.get("summary", ""),
+        "license": index_json.get("license", ""),
+        "home": about.get("home", ""),
+    }
+
     log("extract_metadata.done", filename=filename, subdir=subdir,
         name=index_json.get("name"), elapsed_s=round(time.time() - t0, 3))
 
@@ -180,6 +193,8 @@ def extract_metadata(channel: str, filename: str, staging_key: str) -> dict:
         "subdir": subdir,
         "name": index_json.get("name"),
         "entry": entry,
+        "browse": browse,
+        "version": index_json.get("version"),
     }
 
 
@@ -268,6 +283,30 @@ def ingest_package(channel: str, filename: str, staging_key: str) -> dict:
     )
     # Update the name pointer to the new hash (last-writer-wins; DO serializes).
     s3.put_object(Bucket=BUCKET, Key=ptr_key, Body=new_hash.encode())
+
+    # Write/refresh the compact browse record for this name. Merge subdir into
+    # the set of subdirs this name is available in. Last-writer-wins; the
+    # merger aggregates all of these into browse-index.json.
+    browse = meta.get("browse", {})
+    browse_key = f"{channel}/_browse/{name}.json"
+    subdirs_seen = {subdir}
+    try:
+        existing_browse = json.loads(
+            s3.get_object(Bucket=BUCKET, Key=browse_key)["Body"].read()
+        )
+        subdirs_seen |= set(existing_browse.get("subdirs", []))
+        # Keep the highest version seen for the listing row.
+        if existing_browse.get("version", "") > (browse.get("version") or ""):
+            browse["version"] = existing_browse["version"]
+            browse["summary"] = existing_browse.get("summary", browse.get("summary", ""))
+            browse["license"] = existing_browse.get("license", browse.get("license", ""))
+            browse["home"] = existing_browse.get("home", browse.get("home", ""))
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
+            raise
+    browse["subdirs"] = sorted(subdirs_seen)
+    s3.put_object(Bucket=BUCKET, Key=browse_key,
+                  Body=json.dumps(browse).encode(), ContentType="application/json")
 
     # Move the package file into its final location and drop staging.
     s3.copy_object(Bucket=BUCKET, Key=f"{prefix}/{filename}",
@@ -429,11 +468,40 @@ def rebuild_index_and_repodata(channel: str, subdir: str) -> dict:
                   CacheControl="public, max-age=300",
                   ContentType="application/json")
 
+    # Rebuild the per-channel browse index from all _browse/ records.
+    _rebuild_browse_index(channel)
+
     log("rebuild.done", channel=channel, subdir=subdir, n_names=len(name_to_hash),
         n_packages=len(packages) + len(packages_conda),
         elapsed_s=round(time.time() - t0, 3))
     return {"n_names": len(name_to_hash),
             "n_packages": len(packages) + len(packages_conda)}
+
+
+def _rebuild_browse_index(channel: str) -> None:
+    """Aggregate every per-name browse record under <channel>/_browse/ into a
+    single browse-index.json served to the browse UI. Small (low single-digit
+    MB even at conda-forge scale)."""
+    t0 = time.time()
+    records = []
+    paginator = s3.get_paginator("list_objects_v2")
+    browse_prefix = f"{channel}/_browse/"
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=browse_prefix):
+        for obj in page.get("Contents", []):
+            if not obj["Key"].endswith(".json"):
+                continue
+            try:
+                rec = json.loads(s3.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read())
+                records.append(rec)
+            except Exception:  # noqa: BLE001
+                continue
+    records.sort(key=lambda r: (r.get("name") or "").lower())
+    body = json.dumps({"packages": records}).encode()
+    s3.put_object(Bucket=BUCKET, Key=f"{channel}/browse-index.json",
+                  Body=body, CacheControl="public, max-age=300",
+                  ContentType="application/json")
+    log("browse_index.done", channel=channel, n=len(records),
+        elapsed_s=round(time.time() - t0, 3))
 
 
 def reindex(channel: str, subdir: str) -> None:
