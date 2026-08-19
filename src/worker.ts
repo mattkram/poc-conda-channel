@@ -721,7 +721,7 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Browse packages in the ${esc(channel)} conda channel. Search, filter, and install packages.">
 <title>${esc(channel)} &middot; packages</title>
-<script src="https://unpkg.com/htmx.org@1.9.12"></script>
+<script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
