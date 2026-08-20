@@ -2301,30 +2301,45 @@ async function handleAddTrustedPublisher(request: Request, channel: string, env:
   const denied = await requireChannelOwner(channel, login, env);
   if (denied) return denied;
 
-  let body: {
-    repository?: string | null;
-    workflow?: string | null;
-    environment?: string | null;
-    package_name?: string | null;
-    require_trusted?: boolean | number;
-  };
-  try {
-    body = await request.json();
-  } catch {
-    return new Response("invalid JSON body", { status: 400 });
-  }
+  // Accept both JSON (API clients) and form submissions (admin UI).
+  const ct = request.headers.get("content-type") ?? "";
+  let repository: string | null, workflow: string | null,
+      environment: string | null, package_name: string | null,
+      require_trusted: number;
 
-  const require_trusted = body.require_trusted ? 1 : 0;
+  if (ct.includes("application/x-www-form-urlencoded") || ct.includes("multipart/form-data")) {
+    const fd = await request.formData();
+    const noe = (v: File | string | null) => (v && v.toString().trim()) ? v.toString().trim() : null;
+    repository     = noe(fd.get("repository"));
+    workflow       = noe(fd.get("workflow"));
+    environment    = noe(fd.get("environment"));
+    package_name   = noe(fd.get("package_name"));
+    require_trusted = fd.get("require_trusted") ? 1 : 0;
+  } else {
+    let body: {
+      repository?: string | null; workflow?: string | null;
+      environment?: string | null; package_name?: string | null;
+      require_trusted?: boolean | number;
+    };
+    try { body = await request.json(); }
+    catch { return new Response("invalid JSON body", { status: 400 }); }
+    const noe = (v: string | null | undefined) => (v && v.trim()) ? v.trim() : null;
+    repository     = noe(body.repository);
+    workflow       = noe(body.workflow);
+    environment    = noe(body.environment);
+    package_name   = noe(body.package_name);
+    require_trusted = body.require_trusted ? 1 : 0;
+  }
 
   const result = await env.DB.prepare(
     `INSERT INTO trusted_publishers (channel, repository, workflow, environment, package_name, require_trusted, created_at, created_by)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     channel,
-    body.repository ?? null,
-    body.workflow ?? null,
-    body.environment ?? null,
-    body.package_name ?? null,
+    repository,
+    workflow,
+    environment,
+    package_name,
     require_trusted,
     Date.now(),
     login,
@@ -2335,6 +2350,11 @@ async function handleAddTrustedPublisher(request: Request, channel: string, env:
     `SELECT * FROM trusted_publishers WHERE id = ?`
   ).bind(id).first<TrustedPublisherRow>();
 
+  // Form submissions expect a redirect; API clients get JSON.
+  const ct2 = request.headers.get("content-type") ?? "";
+  if (ct2.includes("application/x-www-form-urlencoded") || ct2.includes("multipart/form-data")) {
+    return new Response(null, { status: 302, headers: { location: `/channels/${channel}/admin` } });
+  }
   return Response.json(row, { status: 201 });
 }
 
