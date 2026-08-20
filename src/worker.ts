@@ -2412,12 +2412,12 @@ async function handleAdminPage(request: Request, channel: string, env: Env): Pro
     return `
     <tr>
       <td class="col-id">${r.id}</td>
-      <td>${code(r.repository)}</td>
-      <td>${code(r.workflow)}</td>
-      <td>${code(r.environment)}</td>
-      <td>${code(r.package_name)}</td>
+      <td class="col-repo">${code(r.repository)}</td>
+      <td class="col-workflow">${code(r.workflow)}</td>
+      <td class="col-env">${code(r.environment)}</td>
+      <td class="col-pkg">${code(r.package_name)}</td>
       <td class="col-bool">${r.require_trusted ? '<span class="yes-badge">Yes</span>' : '<span class="no-badge">No</span>'}</td>
-      <td>${esc(r.created_by)}</td>
+      <td class="col-by">${esc(r.created_by)}</td>
       <td class="col-action">
         <form method="POST" action="/channel/${esc(channel)}/trusted-publishers/${r.id}" style="display:inline">
           <input type="hidden" name="_method" value="DELETE">
@@ -2432,15 +2432,21 @@ async function handleAdminPage(request: Request, channel: string, env: Env): Pro
   const ADMIN_CSS = `
     .admin-section { background:#fff; border:1px solid #e4e7eb; border-radius:8px; padding:20px 24px; margin-bottom:24px; }
     .admin-section h2 { font-size:16px; font-weight:700; margin:0 0 14px; color:#1f2933; }
-    table.tp-table { width:100%; border-collapse:collapse; font-size:13px; table-layout:fixed; }
+    .tp-wrap { overflow-x:auto; }
+    table.tp-table { width:100%; border-collapse:collapse; font-size:13px; }
     .tp-table th { text-align:left; padding:8px 10px; background:#f5f7fa; color:#52606d; font-weight:600; border-bottom:1px solid #e4e7eb; white-space:nowrap; }
-    .tp-table td { padding:8px 10px; border-bottom:1px solid #f0f2f5; vertical-align:middle; word-break:break-all; }
+    .tp-table td { padding:8px 10px; border-bottom:1px solid #f0f2f5; vertical-align:middle; }
     .tp-table tr:last-child td { border-bottom:none; }
     .tp-table tr:hover td { background:#fafbfc; }
-    .tp-table .col-id { width:36px; text-align:center; color:#9aacb8; word-break:normal; }
-    .tp-table .col-bool { width:68px; text-align:center; word-break:normal; }
-    .tp-table .col-action { width:72px; text-align:right; word-break:normal; }
-    code.val { background:#f0f2f5; padding:2px 5px; border-radius:4px; font-size:12px; word-break:break-all; }
+    .tp-table .col-id { width:40px; text-align:center; color:#9aacb8; }
+    .tp-table .col-repo { min-width:140px; }
+    .tp-table .col-workflow { min-width:180px; }
+    .tp-table .col-env { min-width:80px; }
+    .tp-table .col-pkg { min-width:120px; }
+    .tp-table .col-bool { width:80px; text-align:center; white-space:nowrap; }
+    .tp-table .col-by { min-width:80px; white-space:nowrap; }
+    .tp-table .col-action { width:80px; text-align:right; white-space:nowrap; }
+    code.val { background:#f0f2f5; padding:2px 5px; border-radius:4px; font-size:12px; overflow-wrap:anywhere; }
     .wildcard { color:#9aacb8; font-style:italic; font-size:12px; }
     .yes-badge { background:#fdecea; color:#b42318; border-radius:4px; padding:2px 7px; font-size:12px; font-weight:600; }
     .no-badge  { background:#f0f2f5; color:#52606d; border-radius:4px; padding:2px 7px; font-size:12px; }
@@ -2485,6 +2491,7 @@ async function handleAdminPage(request: Request, channel: string, env: Env): Pro
   <div class="admin-section">
     <h2>Trusted Publishers <span class="hint">(GitHub Actions OIDC keyless upload)</span></h2>
     ${rules.length > 0 ? `
+    <div class="tp-wrap">
     <table class="tp-table">
       <thead>
         <tr>
@@ -2492,7 +2499,8 @@ async function handleAdminPage(request: Request, channel: string, env: Env): Pro
         </tr>
       </thead>
       <tbody>${rulesRows}</tbody>
-    </table>` : `<p class="empty-rules">No trusted publisher rules yet.</p>`}
+    </table>
+    </div>` : `<p class="empty-rules">No trusted publisher rules yet.</p>`}
 
     <details style="margin-top:16px">
       <summary style="cursor:pointer;font-weight:600;font-size:13px;color:#2d7a1f">+ Add rule</summary>
