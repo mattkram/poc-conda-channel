@@ -66,7 +66,7 @@ export async function startDeviceFlow(env: Env): Promise<Response> {
   const resp = await fetch("https://github.com/login/device/code", {
     method: "POST",
     headers: { accept: "application/json", "content-type": "application/json" },
-    body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, scope: "read:org" }),
+    body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, scope: "read:user" }),
   });
   const data = await resp.json();
   return Response.json(data);
@@ -93,14 +93,6 @@ export async function pollDeviceFlow(request: Request, env: Env): Promise<Respon
     headers: { authorization: `Bearer ${data.access_token}`, "user-agent": "conda-channel-server" },
   }).then((r) => r.json<{ login: string }>());
 
-  const memberCheck = await fetch(
-    `https://api.github.com/orgs/${env.GITHUB_ORG}/members/${ghUser.login}`,
-    { headers: { authorization: `Bearer ${data.access_token}`, "user-agent": "conda-channel-server" } },
-  );
-  if (memberCheck.status !== 204) {
-    return new Response(`${ghUser.login} is not a member of ${env.GITHUB_ORG}`, { status: 403 });
-  }
-
   const uploadToken = await signUploadToken({ login: ghUser.login }, env.UPLOAD_TOKEN_SECRET);
   return Response.json({ upload_token: uploadToken, expires_in: 3600 });
 }
@@ -117,7 +109,7 @@ export async function handleBrowserLoginStart(request: Request, env: Env): Promi
   const params = new URLSearchParams({
     client_id: env.GITHUB_CLIENT_ID,
     redirect_uri: redirectUri,
-    scope: "read:org",
+    scope: "read:user",
     state,
   });
   const githubUrl = `https://github.com/login/oauth/authorize?${params}`;
@@ -191,19 +183,6 @@ export async function handleBrowserLoginCallback(
       "user-agent": "conda-channel-server",
     },
   }).then((r) => r.json<{ login: string }>());
-
-  const memberCheck = await fetch(
-    `https://api.github.com/orgs/${env.GITHUB_ORG}/members/${ghUser.login}`,
-    {
-      headers: {
-        authorization: `Bearer ${tokenData.access_token}`,
-        "user-agent": "conda-channel-server",
-      },
-    },
-  );
-  if (memberCheck.status !== 204) {
-    return errorPage(`${ghUser.login} is not a member of ${env.GITHUB_ORG}.`);
-  }
 
   const sessionToken = await signUploadToken(
     { login: ghUser.login },

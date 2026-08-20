@@ -15,7 +15,6 @@ export interface Env {
   INGEST_QUEUE: DurableObjectNamespace;
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
-  GITHUB_ORG: string;
   UPLOAD_TOKEN_SECRET: string;
   INTERNAL_SECRET: string;
   SUPERADMIN_LOGIN: string;
