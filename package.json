@@ -1,18 +1,24 @@
 {
   "name": "conda-channel-server",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@cloudflare/containers": "^0.1.0",
     "aws4fetch": "^1.0.20"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0",
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260801.1",
     "typescript": "^5.5.0",
-    "@cloudflare/workers-types": "^5.20260801.1"
+    "vitest": "^4.1.11",
+    "wrangler": "^4.0.0"
   },
   "allowScripts": {
     "esbuild@0.28.1": true,
