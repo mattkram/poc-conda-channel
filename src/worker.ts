@@ -14,6 +14,7 @@ export class IndexerContainer extends Container<Env> {
     R2_SECRET_ACCESS_KEY: env.R2_SECRET_ACCESS_KEY,
     R2_BUCKET_NAME: env.R2_BUCKET_NAME,
     WORKER_URL: "https://conda.matt-kramer.com",
+    INTERNAL_SECRET: env.INTERNAL_SECRET,
   };
 }
 
@@ -28,7 +29,7 @@ export { SubdirIndexMerger } from "./do/subdir-index-merger.js";
 // ---------------------------------------------------------------------------
 // Handler imports
 // ---------------------------------------------------------------------------
-import { startDeviceFlow, pollDeviceFlow, handleBrowserLoginStart, handleBrowserLoginCallback, handleBrowserLogout } from "./auth.js";
+import { startDeviceFlow, pollDeviceFlow, handleBrowserLoginStart, handleBrowserLoginCallback, handleBrowserLogout, resolveLogin } from "./auth.js";
 import { handleGetChannelInfo, handleSetVisibility, handleDeleteChannel } from "./channel.js";
 import { handleUploadInit, handleUploadComplete } from "./upload.js";
 import { handleOidcExchange, handleListTrustedPublishers, handleAddTrustedPublisher, handleDeleteTrustedPublisher } from "./trusted-publishers.js";
@@ -130,10 +131,9 @@ export default {
     if (p === "/internal/abort-multipart" && m === "POST") return handleAbortMultipart(request, env);
 
     if (p === "/internal/list-r2" && m === "POST") {
-      const auth = request.headers.get("authorization") ?? "";
-      const token = auth.replace(/^Bearer\s+/i, "");
-      const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
-      if (!claims) return new Response("unauthorized", { status: 401 });
+      const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
+      if (!login) return new Response("unauthorized", { status: 401 });
+      if (login !== env.SUPERADMIN_LOGIN) return new Response("superadmin only", { status: 403 });
       const body = await request.json<{ prefix?: string; cursor?: string; limit?: number }>();
       const list = await env.CHANNEL_BUCKET.list({
         prefix: body.prefix ?? "",

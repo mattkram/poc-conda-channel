@@ -45,6 +45,7 @@ BUCKET = os.environ.get("R2_BUCKET_NAME", "conda-channel")
 # Worker URL for D1 upserts. Set via envVars in IndexerContainer.
 # If unset (e.g. local dev), D1 upserts are skipped silently.
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
+INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 
 s3 = boto3.client(
     "s3",
@@ -110,7 +111,10 @@ def _upsert_d1(channel: str, browse: dict) -> None:
         req = urllib.request.Request(
             f"{WORKER_URL}/internal/upsert-package",
             data=body,
-            headers={"content-type": "application/json"},
+            headers={
+                "content-type": "application/json",
+                "x-internal-secret": INTERNAL_SECRET,
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5):

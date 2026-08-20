@@ -1,9 +1,45 @@
 import type { Env, UpsertPackageBody } from "./types.js";
 import { CHANNEL_NAME_RE } from "./channel.js";
-import { verifyUploadToken } from "./auth.js";
+import { verifyUploadToken, resolveLogin } from "./auth.js";
 import { r2Client } from "./upload.js";
 
+// ---------------------------------------------------------------------------
+// Auth helpers for internal routes
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifies the `X-Internal-Secret` header matches `env.INTERNAL_SECRET`.
+ * Used for container→worker callbacks that don't have a user login context.
+ */
+function verifyInternalSecret(request: Request, env: Env): boolean {
+  const header = request.headers.get("x-internal-secret") ?? "";
+  return header.length > 0 && header === env.INTERNAL_SECRET;
+}
+
+/**
+ * Returns a 403 Response if the caller is not the superadmin, null on ok.
+ * Accepts both Bearer token and session cookie.
+ */
+async function requireSuperadmin(request: Request, env: Env): Promise<Response | null> {
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
+  if (!login) return new Response("unauthorized", { status: 401 });
+  if (login !== env.SUPERADMIN_LOGIN) {
+    return new Response(`superadmin only — you are '${login}'`, { status: 403 });
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
 export async function handleUpsertPackage(request: Request, env: Env): Promise<Response> {
+  // Called by the container after ingest. Authenticated via a shared secret
+  // header rather than a user token — the container has no GitHub login.
+  if (!verifyInternalSecret(request, env)) {
+    return new Response("unauthorized", { status: 401 });
+  }
+
   const body = await request.json<UpsertPackageBody>();
   const { channel, name, version, summary, license, home, subdirs } = body;
 
@@ -50,15 +86,13 @@ export async function handleReconcile(
 ): Promise<Response> {
   if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
 
-  const auth = request.headers.get("authorization") ?? "";
-  const token = auth.replace(/^Bearer\s+/i, "");
-  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
-  if (!claims) return new Response("unauthorized", { status: 401 });
+  const denied = await requireSuperadmin(request, env);
+  if (denied) return denied;
 
   await env.DB.prepare(
     `INSERT OR IGNORE INTO channels (name, owner, visibility, created_at) VALUES (?, ?, 'public', ?)`,
   )
-    .bind(channel, claims.login, Date.now())
+    .bind(channel, env.SUPERADMIN_LOGIN, Date.now())
     .run();
 
   const prefix = `${channel}/_browse/`;
@@ -110,10 +144,8 @@ export async function handleReconcile(
 }
 
 export async function handleMigrateR2Prefix(request: Request, env: Env): Promise<Response> {
-  const auth = request.headers.get("authorization") ?? "";
-  const token = auth.replace(/^Bearer\s+/i, "");
-  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
-  if (!claims) return new Response("unauthorized", { status: 401 });
+  const denied = await requireSuperadmin(request, env);
+  if (denied) return denied;
 
   const body = await request.json<{ src: string; dst: string; cursor?: string }>();
   const { src, dst, cursor } = body;
@@ -162,10 +194,8 @@ export async function handleMigrateR2Prefix(request: Request, env: Env): Promise
 }
 
 export async function handleDeleteR2Prefix(request: Request, env: Env): Promise<Response> {
-  const auth = request.headers.get("authorization") ?? "";
-  const token = auth.replace(/^Bearer\s+/i, "");
-  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
-  if (!claims) return new Response("unauthorized", { status: 401 });
+  const denied = await requireSuperadmin(request, env);
+  if (denied) return denied;
 
   const body = await request.json<{ prefix: string; cursor?: string }>();
   const { prefix, cursor } = body;
@@ -197,10 +227,8 @@ export async function handlePurgeQueue(
   channel: string,
   env: Env,
 ): Promise<Response> {
-  const auth = request.headers.get("authorization") ?? "";
-  const token = auth.replace(/^Bearer\s+/i, "");
-  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
-  if (!claims) return new Response("unauthorized", { status: 401 });
+  const denied = await requireSuperadmin(request, env);
+  if (denied) return denied;
 
   const [queueResp, ingestResp] = await Promise.all([
     env.QUEUE.get(env.QUEUE.idFromName(channel))
@@ -219,10 +247,8 @@ export async function handlePurgeQueue(
 }
 
 export async function handleAbortMultipart(request: Request, env: Env): Promise<Response> {
-  const auth = request.headers.get("authorization") ?? "";
-  const token = auth.replace(/^Bearer\s+/i, "");
-  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
-  if (!claims) return new Response("unauthorized", { status: 401 });
+  const denied = await requireSuperadmin(request, env);
+  if (denied) return denied;
 
   const body = await request.json<{ debug?: boolean }>().catch(() => ({}));
   const client = r2Client(env);

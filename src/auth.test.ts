@@ -45,9 +45,12 @@ describe("signUploadToken / verifyUploadToken", () => {
   it("respects custom TTL", async () => {
     const before = Math.floor(Date.now() / 1000);
     const token = await signUploadToken({ login: "alice" }, SECRET, 7200);
-    const claims = await verifyUploadToken(token, SECRET);
-    expect(claims).not.toBeNull();
-    expect(claims!.exp).toBeGreaterThanOrEqual(before + 7200 - 1);
+    // Decode the payload directly to check exp without relying on the return type.
+    const [encoded] = token.split(".");
+    const payload = JSON.parse(atob(encoded.replace(/-/g, "+").replace(/_/g, "/")));
+    expect(payload.exp).toBeGreaterThanOrEqual(before + 7200 - 1);
+    // Also confirm it verifies successfully.
+    expect(await verifyUploadToken(token, SECRET)).not.toBeNull();
   });
 });
 
