@@ -11,7 +11,7 @@ import {
 } from "../handlers/channel.js";
 import { verifyUploadToken } from "../handlers/auth.js";
 import { validateChannelAndFilename } from "../handlers/upload.js";
-import { BROWSE_CSS, PKG_DETAIL_CSS, HERO_CSS } from "./ui.js";
+import { BROWSE_CSS, PKG_DETAIL_CSS, HERO_CSS, GOOGLE_FONTS } from "./ui.js";
 import {
   loadBrowseIndex,
   loadChannelSubdirs,
@@ -106,26 +106,6 @@ export async function handleHomepage(request: Request, url: URL, env: Env): Prom
   const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
   const q = url.searchParams.get("q")?.trim() ?? "";
 
-  const { results } = await env.DB.prepare(
-    `SELECT name, owner, visibility FROM channels ORDER BY name`,
-  ).all<{ name: string; owner: string | null; visibility: string }>();
-  const visible = results.filter((c) => c.visibility === "public" || c.owner === login);
-
-  const chanCards = visible
-    .map((ch) => {
-      const ns = channelNamespace(ch.name);
-      const displayName = ns
-        ? `<span style="color:#9aacb8">${esc(ns)}/</span>${esc(ch.name.slice(ns.length + 1))}`
-        : esc(ch.name);
-      const lock =
-        ch.visibility === "private" ? ' <span class="lock-badge">🔒 private</span>' : "";
-      return `<div class="pkg">
-      <a class="name" href="/channels/${ch.name}">${displayName}</a>${lock}
-      <div class="meta">${ch.owner ? `<span>owner: ${esc(ch.owner)}</span>` : ""}<span>conda channel</span></div>
-    </div>`;
-    })
-    .join("");
-
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -134,48 +114,58 @@ export async function handleHomepage(request: Request, url: URL, env: Env): Prom
 <meta name="description" content="Search and browse conda packages across all channels.">
 <title>conda-wit</title>
 <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}${HERO_CSS}</style>
 </head>
 <body>
 <header>
   <a class="brand" href="/">conda-wit</a>
-  <span class="chan-sep">/</span><a class="chan" href="/channels" style="text-decoration:none">channels</a>
+  <span class="chan-sep">/</span>
+  <a class="chan" href="/channels" style="text-decoration:none">channels</a>
   ${userWidget(login)}
 </header>
 
 <div class="hero">
-  <h1>Find conda packages</h1>
-  <p>Search across all public channels hosted on this server.</p>
+  <img class="hero-logo" src="/logo.png" alt="conda-wit — Lightweight &amp; Channeling Your Packages">
+  <p class="hero-tagline">Lightweight &amp; Channeling Your Packages</p>
   <form class="hero-search-wrap"
         hx-get="/search/results"
         hx-trigger="input changed delay:300ms from:input[name='q'], submit"
         hx-target="#search-results"
         action="/search" method="GET">
     <input type="search" name="q" value="${esc(q)}"
-           placeholder="Search packages&hellip;"
+           placeholder="Search packages across all channels&hellip;"
            autocomplete="off" autofocus
            aria-label="Search packages">
     <button type="submit">Search</button>
   </form>
+  <div class="hero-links" id="hero-links"${q ? ' style="display:none"' : ""}>
+    <a href="/channels">Browse channels &rsaquo;</a>
+  </div>
 </div>
 
 <div id="search-results">${q ? `<div style="text-align:center;padding:32px;color:#9aacb8">Loading…</div>
 <script>htmx.ajax('GET','/search/results?q=${encodeURIComponent(q)}',{target:'#search-results'})</script>` : ""}</div>
 
-<div class="channels-section" id="channel-list"${q ? ' style="display:none"' : ""}>
-  <h2>${visible.length} channel${visible.length === 1 ? "" : "s"}</h2>
-  ${chanCards || `<div class="empty">No channels yet.</div>`}
-</div>
-
+<footer style="text-align:center;padding:32px 24px;color:#9aacb8;font-size:13px;font-weight:500;border-top:1px solid #e4e7eb;margin-top:48px;">
+  <a href="https://github.com/mattkram/poc-conda-channel" target="_blank" rel="noopener"
+     style="color:#6B7280;text-decoration:none;display:inline-flex;align-items:center;gap:8px;"
+     onmouseover="this.style.color='#14BBA6'" onmouseout="this.style.color='#6B7280'">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512" width="18" height="18" fill="currentColor" aria-label="GitHub">
+      <path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 390.1 8 244.8 8z"/>
+    </svg>
+    mattkram/poc-conda-channel
+  </a>
+</footer>
 <script>
 document.addEventListener('htmx:afterSettle', () => {
   const q = document.querySelector('input[name="q"]')?.value?.trim();
-  const cl = document.getElementById('channel-list');
-  if (cl) cl.style.display = q ? 'none' : '';
+  const hl = document.getElementById('hero-links');
+  if (hl) hl.style.display = q ? 'none' : '';
 });
 document.querySelector('input[name="q"]')?.addEventListener('input', function() {
-  const cl = document.getElementById('channel-list');
-  if (cl) cl.style.display = this.value.trim() ? 'none' : '';
+  const hl = document.getElementById('hero-links');
+  if (hl) hl.style.display = (this as HTMLInputElement).value.trim() ? 'none' : '';
 });
 </script>
 </body>
@@ -244,6 +234,7 @@ export async function handleGlobalSearch(request: Request, url: URL, env: Env): 
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${q ? `${esc(q)} &middot; ` : ""}Search &middot; conda-wit</title>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
@@ -323,6 +314,7 @@ export async function handleChannelsIndex(request: Request, env: Env): Promise<R
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Browse all conda channels hosted on this server.">
 <title>Channels &middot; conda-wit</title>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
@@ -376,6 +368,7 @@ export async function handleNamespacePage(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Channels owned by ${esc(namespace)}.">
 <title>${esc(namespace)} &middot; channels</title>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
@@ -471,9 +464,10 @@ export async function handleBrowsePage(
 <meta name="description" content="Browse packages in the ${esc(channel)} conda channel. Search, filter, and install packages.">
 <title>${esc(channel)} &middot; packages</title>
 <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}
-  .header-user a.admin-btn { color: #52606d; text-decoration: none; font-size: 13px; }
-  .header-user a.admin-btn:hover { text-decoration: underline; }
+  .header-user a.admin-btn { color: #6B7280; text-decoration: none; font-size: 13px; font-weight: 600; }
+  .header-user a.admin-btn:hover { color: #14BBA6; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -606,9 +600,10 @@ export async function handleBrowsePackage(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="${esc(rec.summary || `${name} package in the ${channel} conda channel`)}">
 <title>${esc(name)} &middot; ${esc(channel)}</title>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}${PKG_DETAIL_CSS}
-  .del-file-btn { background:#fff; color:#b42318; border:1px solid #f5c2bf; padding:3px 10px; border-radius:5px; font-size:12px; cursor:pointer; white-space:nowrap; }
-  .del-file-btn:hover { background:#fdecea; }
+  .del-file-btn { background:#fff; color:#b42318; border:1px solid #fca5a5; padding:3px 10px; border-radius:5px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  .del-file-btn:hover { background:#fef2f2; }
 </style>
 </head>
 <body>
