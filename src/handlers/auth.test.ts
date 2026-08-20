@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { signUploadToken, verifyUploadToken } from "./handlers/auth.js";
-import { matchesRule } from "./handlers/trusted-publishers.js";
-import type { TrustedPublisherRow } from "./types.js";
+import { signUploadToken, verifyUploadToken } from "./auth.js";
+import { matchesRule } from "./trusted-publishers.js";
+import type { TrustedPublisherRow } from "../types.js";
 
 const SECRET = "test-secret-at-least-32-bytes-long!!";
 
