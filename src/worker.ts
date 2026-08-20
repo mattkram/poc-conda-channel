@@ -1096,13 +1096,13 @@ async function handleHomepage(request: Request, url: URL, env: Env): Promise<Res
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Search and browse conda packages across all channels.">
-<title>conda-channel-server</title>
+<title>conda-wit</title>
 <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
 <style>${BROWSE_CSS}${HERO_CSS}</style>
 </head>
 <body>
 <header>
-  <a class="brand" href="/">conda-channel-server</a>
+  <a class="brand" href="/">conda-wit</a>
   <span class="chan-sep">/</span><a class="chan" href="/channels" style="text-decoration:none">channels</a>
   ${userWidget(login)}
 </header>
@@ -1198,12 +1198,12 @@ async function handleGlobalSearch(request: Request, url: URL, env: Env): Promise
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${q ? `${esc(q)} &middot; ` : ""}Search &middot; conda-channel-server</title>
+<title>${q ? `${esc(q)} &middot; ` : ""}Search &middot; conda-wit</title>
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
 <header>
-  <a class="brand" href="/channels">conda-channel-server</a>
+  <a class="brand" href="/">conda-wit</a>
   <span class="chan-sep">/</span><span class="chan">search</span>
   ${userWidget(login)}
 </header>
@@ -1274,12 +1274,12 @@ async function handleChannelsIndex(request: Request, env: Env): Promise<Response
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Browse all conda channels hosted on this server.">
-<title>Channels &middot; conda-channel-server</title>
+<title>Channels &middot; conda-wit</title>
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
 <header>
-  <a class="brand" href="/channels">conda-channel-server</a>
+  <a class="brand" href="/">conda-wit</a>
   <span class="chan-sep">/</span><span class="chan">channels</span>
   ${userWidget(login)}
 </header>
@@ -1333,7 +1333,7 @@ async function handleNamespacePage(
 </head>
 <body>
 <header>
-  <a class="brand" href="/channels">conda-channel-server</a>
+  <a class="brand" href="/">conda-wit</a>
   <span class="chan-sep">/</span>
   <span class="chan">${esc(namespace)}</span>
   ${userWidget(login)}
@@ -1721,7 +1721,7 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
 </head>
 <body>
 <header>
-  <a class="brand" href="/channels">conda-channel-server</a>
+  <a class="brand" href="/">conda-wit</a>
   ${channelHeader}
   <div class="header-user">
     ${adminLink}
@@ -1901,7 +1901,7 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
 </head>
 <body>
 <header>
-  <a class="brand" href="/channels">conda-channel-server</a>
+  <a class="brand" href="/">conda-wit</a>
   <span class="chan-sep">/</span>
   <a class="chan-ns" href="/channels/${channel.split("/")[0]}">${esc(channel.split("/")[0])}</a>
   <span class="chan-sep">/</span>
@@ -2391,7 +2391,7 @@ async function handleBrowserLoginCallback(request: Request, url: URL, env: Env):
   const errorPage = (msg: string) => new Response(
     `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Login error</title>` +
     `<style>body{font-family:sans-serif;padding:40px;color:#c0392b}</style></head>` +
-    `<body><h2>Login failed</h2><p>${esc(msg)}</p><a href="/channels">Back</a></body></html>`,
+    `<body><h2>Login failed</h2><p>${esc(msg)}</p><a href="/">Back</a></body></html>`,
     { status: 400, headers: { "content-type": "text/html;charset=utf-8" } }
   );
 
@@ -2822,7 +2822,7 @@ async function handleAdminPage(request: Request, channel: string, env: Env): Pro
 </head>
 <body>
 <header>
-  <a class="brand" href="/channels">conda-channel-server</a>
+  <a class="brand" href="/">conda-wit</a>
   <span class="chan-sep">/</span>
   ${channelHeader}
   <span class="chan-sep">/</span>
