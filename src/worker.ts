@@ -1373,10 +1373,19 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
   const records = await loadBrowseIndex(channel, env, q, sort);
   const results = renderResults(channel, records, q, sort, page);
 
+  const chanRow = await env.DB.prepare(
+    `SELECT owner FROM channels WHERE name = ?`
+  ).bind(channel).first<{ owner: string | null }>();
+  const isOwner = !!login && login === chanRow?.owner;
+
   const ns = channelNamespace(channel);
   const channelHeader = ns
     ? `<a class="chan-ns" href="/channels/${esc(ns)}">${esc(ns)}</a><span class="chan-sep">/</span><span class="chan">${esc(channel.slice(ns.length + 1))}</span>`
     : `<span class="chan">${esc(channel)}</span>`;
+
+  const adminLink = isOwner
+    ? `<a class="admin-btn" href="/channels/${esc(channel)}/admin">&#9881; Settings</a>`
+    : "";
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -1386,13 +1395,21 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
 <meta name="description" content="Browse packages in the ${esc(channel)} conda channel. Search, filter, and install packages.">
 <title>${esc(channel)} &middot; packages</title>
 <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
-<style>${BROWSE_CSS}</style>
+<style>${BROWSE_CSS}
+  .header-user a.admin-btn { color: #52606d; text-decoration: none; font-size: 13px; }
+  .header-user a.admin-btn:hover { text-decoration: underline; }
+</style>
 </head>
 <body>
 <header>
   <a class="brand" href="/channels">conda-channel-server</a>
   ${channelHeader}
-  ${userWidget(login)}
+  <div class="header-user">
+    ${adminLink}
+    ${login
+      ? `<span>👤 ${esc(login)}</span><a class="logout-btn" href="/auth/logout">Log out</a>`
+      : `<a class="login-btn" href="/auth/login">Log in with GitHub</a>`}
+  </div>
 </header>
 <main>
 <div class="wrap">
