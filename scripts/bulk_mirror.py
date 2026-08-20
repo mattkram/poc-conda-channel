@@ -81,6 +81,7 @@ def api(server: str, path: str, body: dict, token: str) -> dict:
         headers={
             "content-type": "application/json",
             "authorization": f"Bearer {token}",
+            "user-agent": "conda/24.9.2",
         },
         method="POST",
     )
