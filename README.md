@@ -72,24 +72,39 @@ above cover it.
    `PackageIngestor` (one DO instance per file), which immediately enqueues
    it onto `ChannelIngestQueue` (one instance per channel).
 9. `ChannelIngestQueue` drains its work items one at a time, calling the
-   container's `/ingest-package` for each file. The container extracts the
-   package's real `subdir` from its metadata, moves it from `_incoming/` to
-   its final location, and writes a per-package shard + updates the shard
-   pointer for that subdir. After each successful ingest it notifies
+   container's `/ingest-package` for each file. The container downloads the
+   package, extracts its metadata using `conda_package_streaming` (the same
+   library conda-index uses internally), computes checksums, and writes a
+   per-package CEP-16 shard to R2. It does **not** call `conda-index` on the
+   hot path — metadata is extracted per-package incrementally, not by
+   scanning the whole subdir. After each successful ingest it notifies
    `SubdirIndexMerger` for the affected subdir.
 10. `SubdirIndexMerger` (one instance per `channel/subdir`) debounces
     `rebuild-index` calls with a ~3s window — so if five packages land in
-    `linux-64` within a few seconds, only one full conda-index rebuild runs,
-    not five. When the alarm fires it calls the container's `/rebuild-index`,
-    which merges all the per-package shards into a new
-    `repodata_shards.msgpack.zst` and regenerates the monolithic
-    `repodata.json` for that subdir.
+    `linux-64` within a few seconds, only one full rebuild runs, not five.
+    When the alarm fires it calls the container's `/rebuild-index`, which
+    reads all current per-package shards from R2, assembles them into a new
+    `repodata_shards.msgpack.zst` (CEP-16 shard index) and regenerates the
+    monolithic `repodata.json`. Again, no `conda-index` call — the rebuild
+    assembles `repodata.json` directly from the shards, which already contain
+    the complete per-file metadata.
 11. The container also writes `_browse/<name>.json` for each ingested package
     and calls back to `POST /internal/upsert-package` on the Worker to keep
     D1 in sync — this is what powers the browse UI and search.
 
-The only service that ever reads package bytes is the container, and it has
-to — that's what makes conda-index work.
+The only service that ever reads package bytes is the container (step 9),
+and it has to — that's what makes metadata extraction work.
+
+> **Note on conda-index:** `conda-index` is still present in the container
+> image and is invoked on the **slow path** only: `DELETE`ing a package
+> triggers a full `conda-index` reindex of the affected subdir (since
+> removing a file requires scanning what's left). Normal uploads never call
+> `conda-index` — we replicate what it produces (same `repodata.json` fields,
+> same CEP-16 shard format) by extracting metadata per-package with
+> `conda_package_streaming`. This means `patch_instructions.json` and
+> `current_repodata.json` are not generated on the hot path; for private/org
+> channels built from your own packages this is fine, but mirroring
+> conda-forge would require the full reindex path.
 
 ### Durable Object roles
 
