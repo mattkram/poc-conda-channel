@@ -3,6 +3,7 @@
 # instead — never commit real values here or in wrangler.toml.
 
 GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
 GITHUB_ORG=
 UPLOAD_TOKEN_SECRET=
 R2_ACCESS_KEY_ID=

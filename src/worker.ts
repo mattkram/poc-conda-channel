@@ -11,6 +11,7 @@ export interface Env {
   MERGER: DurableObjectNamespace;
   INGEST_QUEUE: DurableObjectNamespace;
   GITHUB_CLIENT_ID: string;
+  GITHUB_CLIENT_SECRET: string;
   GITHUB_ORG: string;
   UPLOAD_TOKEN_SECRET: string;
   // Same R2 API token the container uses (S3-compatible creds), needed here
@@ -268,10 +269,23 @@ export class ChannelIngestQueue extends DurableObject<Env> {
       await this.ctx.storage.put(retryKey, upload);
       await this.ctx.storage.delete(key);
     } else {
-      const result = await resp.json<{ already_ingested?: boolean; subdir?: string; name?: string }>();
+      const result = await resp.json<{
+        already_ingested?: boolean;
+        subdir?: string;
+        name?: string;
+        old_hash?: string;
+        new_hash?: string;
+      }>();
       await this.ctx.storage.delete(key);
 
       if (!result.already_ingested && result.subdir) {
+        // Delete the old shard now that the pointer has moved to the new one.
+        // old_hash is absent on the very first upload for a name (no prior shard).
+        if (result.old_hash && result.old_hash !== result.new_hash) {
+          const oldShardKey = `${channel}/${result.subdir}/${result.old_hash}.msgpack.zst`;
+          await this.env.CHANNEL_BUCKET.delete(oldShardKey);
+        }
+
         const mergerId = this.env.MERGER.idFromName(`${channel}/${result.subdir}`);
         const merger = this.env.MERGER.get(mergerId);
         await merger.fetch("http://merger/notify", {
@@ -364,6 +378,15 @@ export default {
     if (url.pathname === "/auth/device/poll" && request.method === "POST") {
       return pollDeviceFlow(request, env);
     }
+    if (url.pathname === "/auth/login" && request.method === "GET") {
+      return handleBrowserLoginStart(request, env);
+    }
+    if (url.pathname === "/auth/callback" && request.method === "GET") {
+      return handleBrowserLoginCallback(request, url, env);
+    }
+    if (url.pathname === "/auth/logout" && request.method === "GET") {
+      return handleBrowserLogout(url);
+    }
     if (url.pathname === "/upload/init" && request.method === "POST") {
       return handleUploadInit(request, env);
     }
@@ -393,7 +416,7 @@ export default {
           `SELECT name, owner, visibility FROM channels WHERE name LIKE ? OR name = ? ORDER BY name`
         ).bind(`${seg}/%`, seg).all<{ name: string; owner: string | null; visibility: string }>();
         if (nsChannels.results.some(r => r.name.startsWith(`${seg}/`))) {
-          return handleNamespacePage(seg, nsChannels.results);
+          return handleNamespacePage(request, seg, nsChannels.results, env);
         }
       }
       return handleBrowsePage(request, seg, url, env);
@@ -708,6 +731,43 @@ interface BrowseRecord {
 
 const PAGE_SIZE = 25;
 
+const PKG_DETAIL_CSS = `
+  .pkg-hero { background:#fff; border:1px solid #e4e7eb; border-radius:10px; padding:24px 28px; margin-bottom:24px; }
+  .pkg-title { display:flex; align-items:baseline; gap:12px; margin-bottom:8px; }
+  .pkg-title h1 { margin:0; font-size:24px; }
+  .ver-badge { background:#2d7a1f; color:#fff; border-radius:6px; padding:3px 10px; font-size:14px; font-weight:600; }
+  .pkg-summary { color:#3d4f5c; font-size:15px; margin:8px 0 14px; }
+  .pkg-attrs { display:flex; flex-direction:column; gap:6px; font-size:13px; }
+  .attr { display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+  .attr-label { font-weight:600; color:#52606d; min-width:60px; }
+  .detail-section { margin-bottom:28px; }
+  .detail-section h2 { font-size:16px; font-weight:700; margin:0 0 12px; color:#1f2933; display:flex; align-items:center; gap:8px; }
+  .ver-count { font-size:12px; font-weight:400; color:#52606d; }
+  .install-block { display:flex; align-items:center; gap:12px; background:#f0f2f5; border-radius:6px; padding:12px 16px; flex-wrap:wrap; }
+  .install-block code { flex:1; font-size:13px; background:none; padding:0; user-select:all; }
+  .copy-btn { padding:6px 14px; background:#2d7a1f; color:#fff; border:none; border-radius:6px; font-size:13px; cursor:pointer; white-space:nowrap; }
+  .copy-btn:hover { background:#246018; }
+  details { border:1px solid #e4e7eb; border-radius:8px; margin-bottom:8px; overflow:hidden; }
+  summary.ver-summary { display:flex; align-items:center; gap:10px; padding:12px 16px; cursor:pointer; background:#fff; list-style:none; user-select:none; }
+  summary.ver-summary::-webkit-details-marker { display:none; }
+  details[open] summary.ver-summary { border-bottom:1px solid #e4e7eb; }
+  summary.ver-summary::before { content:"▶"; font-size:10px; color:#9aacb8; transition:transform .15s; flex-shrink:0; }
+  details[open] summary.ver-summary::before { transform:rotate(90deg); }
+  .ver-num { font-size:15px; font-weight:700; color:#1f6f18; }
+  .ver-subdirs { display:flex; gap:4px; flex-wrap:wrap; margin-left:auto; }
+  .files-table { width:100%; border-collapse:collapse; font-size:13px; }
+  .files-table th { text-align:left; padding:8px 12px; background:#f5f7fa; color:#52606d; font-weight:600; border-bottom:1px solid #e4e7eb; }
+  .files-table td { padding:8px 12px; border-bottom:1px solid #f0f2f5; vertical-align:middle; }
+  .files-table tr:last-child td { border-bottom:none; }
+  .files-table tr:hover td { background:#fafbfc; }
+  a.dl-link { color:#1f6f18; text-decoration:none; font-weight:500; }
+  a.dl-link:hover { text-decoration:underline; }
+  .num { color:#52606d; white-space:nowrap; }
+  .mono { font-family:monospace; }
+  .deps-list { list-style:none; padding:0; margin:0; display:flex; flex-wrap:wrap; gap:6px; }
+  .deps-list li code { font-size:12px; }
+`;
+
 const BROWSE_CSS = `
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #1f2933; background: #f5f7fa; }
@@ -717,6 +777,11 @@ const BROWSE_CSS = `
   header .chan-ns:hover { text-decoration: underline; }
   header .chan-sep { color: #9aacb8; font-size: 14px; padding: 0 2px; }
   header .chan { color: #3d4f5c; font-size: 14px; font-weight: 600; }
+  .header-user { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 13px; color: #3d4f5c; }
+  .header-user a.login-btn { padding: 5px 14px; background: #2d7a1f; color: #fff; border-radius: 6px; text-decoration: none; font-weight: 600; }
+  .header-user a.login-btn:hover { background: #246018; }
+  .header-user a.logout-btn { color: #52606d; text-decoration: none; }
+  .header-user a.logout-btn:hover { text-decoration: underline; }
   .wrap { max-width: 960px; margin: 0 auto; padding: 24px; }
   .controls { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
   .controls label.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
@@ -735,10 +800,23 @@ const BROWSE_CSS = `
   .pager .cur { background: #2d7a1f; color: #fff; border-color: #2d7a1f; }
   .empty { color: #3d4f5c; padding: 40px; text-align: center; }
   code { background: #f0f2f5; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  .lock-badge { background: #fdecea; color: #b42318; border-radius: 4px; padding: 2px 8px; font-size: 12px; margin-left: 4px; }
 `;
 
 function esc(s: string): string {
   return (s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function userWidget(login: string | null): string {
+  if (login) {
+    return `<div class="header-user">
+      <span>👤 ${esc(login)}</span>
+      <a class="logout-btn" href="/auth/logout">Log out</a>
+    </div>`;
+  }
+  return `<div class="header-user">
+    <a class="login-btn" href="/auth/login">Log in with GitHub</a>
+  </div>`;
 }
 
 async function loadBrowseIndex(channel: string, env: Env, q?: string, sort?: string): Promise<BrowseRecord[]> {
@@ -813,23 +891,40 @@ function renderResults(channel: string, records: BrowseRecord[], q: string, sort
   return `<div class="count">${total} package${total === 1 ? "" : "s"}</div>${rows}${pager}`;
 }
 
+// Resolve the logged-in GitHub login from either a Bearer token (CLI) or
+// the __session cookie (browser). Returns null if not authenticated.
+async function resolveLogin(request: Request, secret: string): Promise<string | null> {
+  // Bearer token takes priority (CLI / API clients).
+  const auth = request.headers.get("authorization") ?? "";
+  const bearer = auth.replace(/^Bearer\s+/i, "");
+  if (bearer) {
+    const claims = await verifyUploadToken(bearer, secret);
+    if (claims) return claims.login;
+  }
+  // Fall back to session cookie (browser).
+  return getSessionLogin(request, secret);
+}
+
 async function browseAuth(request: Request, channel: string, env: Env): Promise<Response | null> {
   if (!CHANNEL_NAME_RE.test(channel)) return new Response("not found", { status: 404 });
-  const auth = request.headers.get("authorization") ?? "";
-  const token = auth.replace(/^Bearer\s+/i, "");
-  const claims = token ? await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET) : null;
-  return checkReadAccess(channel, claims?.login ?? null, env);
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
+  return checkReadAccess(channel, login, env);
 }
 
 // GET /channels — parent page listing all channels from D1.
 async function handleChannelsIndex(request: Request, env: Env): Promise<Response> {
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
   const { results } = await env.DB.prepare(
     `SELECT name, owner, visibility FROM channels ORDER BY name`
   ).all<{ name: string; owner: string | null; visibility: string }>();
 
-  const cards = results.map((ch) => {
-    const lock = ch.visibility === "private"
-      ? ' <span class="badge" style="background:#fdecea;color:#b42318">private</span>'
+  // Hide private channels the viewer doesn't own.
+  const visible = results.filter(ch => ch.visibility === "public" || ch.owner === login);
+
+  const cards = visible.map((ch) => {
+    const isPrivate = ch.visibility === "private";
+    const lock = isPrivate
+      ? ' <span class="lock-badge">🔒 private</span>'
       : "";
     const ns = channelNamespace(ch.name);
     const displayName = ns
@@ -852,10 +947,14 @@ async function handleChannelsIndex(request: Request, env: Env): Promise<Response
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
-<header><a class="brand" href="/channels">conda-channel-server</a><span class="chan">channels</span></header>
+<header>
+  <a class="brand" href="/channels">conda-channel-server</a>
+  <span class="chan-sep">/</span><span class="chan">channels</span>
+  ${userWidget(login)}
+</header>
 <main>
 <div class="wrap">
-  <div class="count">${results.length} channel${results.length === 1 ? "" : "s"}</div>
+  <div class="count">${visible.length} channel${visible.length === 1 ? "" : "s"}</div>
   ${cards.join("") || `<div class="empty">No channels yet.</div>`}
 </div>
 </main>
@@ -865,15 +964,21 @@ async function handleChannelsIndex(request: Request, env: Env): Promise<Response
 }
 
 // GET /channels/:namespace — list all channels in a namespace.
-function handleNamespacePage(
+async function handleNamespacePage(
+  request: Request,
   namespace: string,
-  channels: Array<{ name: string; owner: string | null; visibility: string }>
-): Response {
-  const nsChannels = channels.filter(ch => ch.name.startsWith(`${namespace}/`));
+  channels: Array<{ name: string; owner: string | null; visibility: string }>,
+  env: Env,
+): Promise<Response> {
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
+  const nsChannels = channels
+    .filter(ch => ch.name.startsWith(`${namespace}/`))
+    .filter(ch => ch.visibility === "public" || ch.owner === login);
+
   const cards = nsChannels.map((ch) => {
     const short = ch.name.slice(namespace.length + 1);
     const lock = ch.visibility === "private"
-      ? ' <span class="badge" style="background:#fdecea;color:#b42318">private</span>'
+      ? ' <span class="lock-badge">🔒 private</span>'
       : "";
     return `
       <div class="pkg">
@@ -893,7 +998,9 @@ function handleNamespacePage(
 <body>
 <header>
   <a class="brand" href="/channels">conda-channel-server</a>
+  <span class="chan-sep">/</span>
   <span class="chan">${esc(namespace)}</span>
+  ${userWidget(login)}
 </header>
 <main>
 <div class="wrap">
@@ -1239,6 +1346,7 @@ async function handleBrowseResults(request: Request, channel: string, url: URL, 
 async function handleBrowsePage(request: Request, channel: string, url: URL, env: Env): Promise<Response> {
   const denied = await browseAuth(request, channel, env);
   if (denied) return denied;
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
   const q = url.searchParams.get("q") ?? "";
   const sort = url.searchParams.get("sort") ?? "name-asc";
   const page = parseInt(url.searchParams.get("page") ?? "1", 10) || 1;
@@ -1264,6 +1372,7 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
 <header>
   <a class="brand" href="/channels">conda-channel-server</a>
   ${channelHeader}
+  ${userWidget(login)}
 </header>
 <main>
 <div class="wrap">
@@ -1284,12 +1393,71 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
+interface BuildEntry {
+  subdir: string;
+  filename: string;
+  version: string;
+  build: string;
+  build_number: number;
+  timestamp?: number;
+  size?: number;
+  md5?: string;
+  sha256?: string;
+  depends?: string[];
+}
+
+// Read all builds for a package name from the per-name shards stored in R2.
+// One shard per subdir — fetched in parallel via _shardptr/<name> pointers.
+// Read all builds for a package name from repodata.json files (one per subdir).
+// Workers can't decode zstd natively, so we use repodata.json rather than the
+// msgpack+zstd shards; both contain the same per-file metadata.
+// Returns full metadata including deps, size, checksums, timestamp.
+async function loadBuildsFromRepodata(channel: string, name: string, subdirs: string[], env: Env): Promise<BuildEntry[]> {
+  const results = await Promise.all(subdirs.map(async (subdir) => {
+    const obj = await env.CHANNEL_BUCKET.get(`${channel}/${subdir}/repodata.json`);
+    if (!obj) return [];
+    const rd = await obj.json<{ packages?: Record<string, any>; "packages.conda"?: Record<string, any> }>();
+    const entries: BuildEntry[] = [];
+    for (const [fn, meta] of Object.entries({ ...(rd.packages ?? {}), ...(rd["packages.conda"] ?? {}) })) {
+      if (meta.name === name) {
+        entries.push({
+          subdir,
+          filename: fn,
+          version: meta.version ?? "",
+          build: meta.build ?? "",
+          build_number: meta.build_number ?? 0,
+          timestamp: meta.timestamp,
+          size: meta.size,
+          md5: meta.md5,
+          sha256: meta.sha256,
+          depends: meta.depends ?? [],
+        });
+      }
+    }
+    return entries;
+  }));
+  return results.flat();
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function fmtDate(ts?: number): string {
+  if (!ts) return "";
+  // conda timestamps are in milliseconds
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
 async function handleBrowsePackage(request: Request, channel: string, name: string, env: Env): Promise<Response> {
   const denied = await browseAuth(request, channel, env);
   if (denied) return denied;
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
   name = decodeURIComponent(name);
 
-  // Look up package record from D1 — fast single-row read.
+  // D1 lookup for summary, license, home, latest version, subdirs.
   const row = await env.DB.prepare(
     `SELECT name, version, summary, license, home, subdirs FROM packages WHERE channel = ? AND name = ?`
   ).bind(channel, name).first<{
@@ -1299,26 +1467,66 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
   if (!row) return new Response("package not found", { status: 404 });
   const rec: BrowseRecord = { ...row, subdirs: JSON.parse(row.subdirs ?? "[]") as string[] };
 
-  const builds: { subdir: string; filename: string; version: string; build: string }[] = [];
-  for (const subdir of rec.subdirs ?? []) {
-    const obj = await env.CHANNEL_BUCKET.get(`${channel}/${subdir}/repodata.json`);
-    if (!obj) continue;
-    const rd = await obj.json<{ packages: Record<string, any>; "packages.conda": Record<string, any> }>();
-    for (const [fn, meta] of Object.entries({ ...(rd.packages ?? {}), ...(rd["packages.conda"] ?? {}) })) {
-      if ((meta as any).name === name) {
-        builds.push({ subdir, filename: fn, version: (meta as any).version, build: (meta as any).build });
-      }
-    }
-  }
-  builds.sort((a, b) => b.version.localeCompare(a.version) || a.filename.localeCompare(b.filename));
+  // Load all builds from repodata.json (has full metadata: deps, size, sha256, etc.)
+  const builds = await loadBuildsFromRepodata(channel, name, rec.subdirs ?? [], env);
 
-  const buildRows = builds.map((b) => `
-    <div class="pkg">
-      <a class="name" href="/repo/${channel}/${b.subdir}/${encodeURIComponent(b.filename)}">${esc(b.filename)}</a>
-      <div class="meta"><span class="badge">${esc(b.subdir)}</span><span>v${esc(b.version)}</span><span>${esc(b.build)}</span></div>
-    </div>`).join("");
+  // Sort: version descending, then subdir, then filename.
+  builds.sort((a, b) =>
+    b.version.localeCompare(a.version, undefined, { numeric: true }) ||
+    a.subdir.localeCompare(b.subdir) ||
+    a.filename.localeCompare(b.filename)
+  );
+
+  // Group by version for the version history section.
+  const byVersion = new Map<string, BuildEntry[]>();
+  for (const b of builds) {
+    if (!byVersion.has(b.version)) byVersion.set(b.version, []);
+    byVersion.get(b.version)!.push(b);
+  }
+
+  // Latest version for the install snippet and dependency list.
+  const latestVersion = builds[0]?.version ?? rec.version;
+  const latestBuilds = byVersion.get(latestVersion) ?? [];
+  // Collect unique deps from all builds of the latest version.
+  const latestDeps = [...new Set(latestBuilds.flatMap((b) => b.depends ?? []))].sort();
 
   const origin = new URL(request.url).origin;
+  const repoUrl = `${origin}/repo/${channel}`;
+  const installCmd = `conda install -c ${repoUrl} ${name}`;
+
+  // Render one file row inside a version group.
+  const fileRow = (b: BuildEntry) => `
+    <tr>
+      <td><a class="dl-link" href="/repo/${channel}/${b.subdir}/${encodeURIComponent(b.filename)}" title="Download">${esc(b.filename)}</a></td>
+      <td><span class="badge">${esc(b.subdir)}</span></td>
+      <td>${esc(b.build)}</td>
+      <td class="num">${b.size != null ? fmtBytes(b.size) : ""}</td>
+      <td class="num mono" title="${b.sha256 ? `SHA256: ${b.sha256}` : ""}">${b.md5 ? b.md5.slice(0, 8) + "…" : ""}</td>
+      <td class="num">${fmtDate(b.timestamp)}</td>
+    </tr>`;
+
+  // Render version group (collapsible <details>).
+  const versionGroups = [...byVersion.entries()].map(([ver, vbuilds], i) => `
+  <details${i === 0 ? " open" : ""}>
+    <summary class="ver-summary">
+      <span class="ver-num">${esc(ver)}</span>
+      <span class="ver-count">${vbuilds.length} file${vbuilds.length === 1 ? "" : "s"}</span>
+      <span class="ver-subdirs">${[...new Set(vbuilds.map((b) => b.subdir))].map((s) => `<span class="badge">${esc(s)}</span>`).join(" ")}</span>
+    </summary>
+    <table class="files-table">
+      <thead><tr><th>Filename</th><th>Subdir</th><th>Build</th><th>Size</th><th>MD5</th><th>Date</th></tr></thead>
+      <tbody>${vbuilds.map(fileRow).join("")}</tbody>
+    </table>
+  </details>`).join("");
+
+  const depsSection = latestDeps.length ? `
+  <section class="detail-section">
+    <h2>Dependencies <span class="ver-count">(${esc(latestVersion)})</span></h2>
+    <ul class="deps-list">
+      ${latestDeps.map((d) => `<li><code>${esc(d)}</code></li>`).join("")}
+    </ul>
+  </section>` : "";
+
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1326,24 +1534,50 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="${esc(rec.summary || `${name} package in the ${channel} conda channel`)}">
 <title>${esc(name)} &middot; ${esc(channel)}</title>
-<style>${BROWSE_CSS}</style>
+<style>${BROWSE_CSS}${PKG_DETAIL_CSS}</style>
 </head>
 <body>
 <header>
   <a class="brand" href="/channels">conda-channel-server</a>
-  <span class="chan">/ <a href="/channels/${channel}" style="color:#3d4f5c">${esc(channel)}</a> / ${esc(name)}</span>
+  <span class="chan-sep">/</span>
+  <a class="chan-ns" href="/channels/${channel.split("/")[0]}">${esc(channel.split("/")[0])}</a>
+  <span class="chan-sep">/</span>
+  <a class="chan" href="/channels/${channel}">${esc(channel.split("/").slice(1).join("/"))}</a>
+  <span class="chan-sep">/</span>
+  <span class="chan">${esc(name)}</span>
+  ${userWidget(login)}
 </header>
 <main>
 <div class="wrap">
-  <h1 style="margin:0 0 4px">${esc(name)} <span class="ver">${esc(rec.version)}</span></h1>
-  ${rec.summary ? `<p class="summary">${esc(rec.summary)}</p>` : ""}
-  <div class="meta" style="margin-bottom:20px">
-    ${rec.license ? `<span>License: ${esc(rec.license)}</span>` : ""}
-    ${rec.home ? `<span><a href="${esc(rec.home)}">${esc(rec.home)}</a></span>` : ""}
+
+  <div class="pkg-hero">
+    <div class="pkg-title">
+      <h1>${esc(name)}</h1>
+      <span class="ver-badge">${esc(latestVersion)}</span>
+    </div>
+    ${rec.summary ? `<p class="pkg-summary">${esc(rec.summary)}</p>` : ""}
+    <div class="pkg-attrs">
+      ${rec.license ? `<span class="attr"><span class="attr-label">License</span>${esc(rec.license)}</span>` : ""}
+      ${rec.home ? `<span class="attr"><span class="attr-label">Home</span><a href="${esc(rec.home)}" target="_blank" rel="noopener">${esc(rec.home)}</a></span>` : ""}
+      <span class="attr"><span class="attr-label">Subdirs</span>${(rec.subdirs ?? []).map((s) => `<span class="badge">${esc(s)}</span>`).join(" ")}</span>
+    </div>
   </div>
-  <p><strong>Install:</strong> <code>conda install -c ${esc(origin)}/repo/${esc(channel)} ${esc(name)}</code></p>
-  <h2 style="font-size:16px;margin-top:24px">Files</h2>
-  ${buildRows || `<div class="empty">No files.</div>`}
+
+  <section class="detail-section">
+    <h2>Install</h2>
+    <div class="install-block">
+      <code id="install-cmd">${esc(installCmd)}</code>
+      <button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('install-cmd').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})">Copy</button>
+    </div>
+  </section>
+
+  ${depsSection}
+
+  <section class="detail-section">
+    <h2>Files <span class="ver-count">${builds.length} total across ${byVersion.size} version${byVersion.size === 1 ? "" : "s"}</span></h2>
+    ${versionGroups || `<div class="empty">No files.</div>`}
+  </section>
+
 </div>
 </main>
 </body>
@@ -1626,8 +1860,8 @@ async function pollDeviceFlow(request: Request, env: Env): Promise<Response> {
 // dependency for something this small. 1hr expiry, scoped to nothing but
 // "can call /upload".
 // ---------------------------------------------------------------------------
-async function signUploadToken(payload: { login: string }, secret: string): Promise<string> {
-  const body = { ...payload, exp: Math.floor(Date.now() / 1000) + 3600 };
+async function signUploadToken(payload: { login: string }, secret: string, ttl = 3600): Promise<string> {
+  const body = { ...payload, exp: Math.floor(Date.now() / 1000) + ttl };
   const encoded = b64url(JSON.stringify(body));
   const sig = await hmac(encoded, secret);
   return `${encoded}.${sig}`;
@@ -1653,4 +1887,147 @@ async function hmac(data: string, secret: string): Promise<string> {
   );
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
   return b64url(String.fromCharCode(...new Uint8Array(sig)));
+}
+
+// ---------------------------------------------------------------------------
+// Browser OAuth (GitHub web application flow)
+//
+// GET /auth/login   — redirect to GitHub with a state CSRF token
+// GET /auth/callback — exchange code for access_token, verify org membership,
+//                      set a signed HttpOnly session cookie, redirect to /channels
+// GET /auth/logout  — clear the session cookie, redirect to /channels
+//
+// The session cookie is the same HMAC-signed token format as upload tokens
+// (base64url(JSON({login,exp})).sig) so verifyUploadToken reuses for both.
+// Cookie name: __session   Lifetime: 8 hours   Flags: HttpOnly; Secure; SameSite=Lax
+// ---------------------------------------------------------------------------
+
+const SESSION_COOKIE = "__session";
+const SESSION_TTL    = 8 * 3600; // seconds
+
+function getSessionToken(request: Request): string | null {
+  const cookie = request.headers.get("cookie") ?? "";
+  for (const part of cookie.split(";")) {
+    const [k, ...v] = part.trim().split("=");
+    if (k.trim() === SESSION_COOKIE) return decodeURIComponent(v.join("="));
+  }
+  return null;
+}
+
+async function getSessionLogin(request: Request, secret: string): Promise<string | null> {
+  const token = getSessionToken(request);
+  if (!token) return null;
+  const claims = await verifyUploadToken(token, secret);
+  return claims?.login ?? null;
+}
+
+function sessionCookieHeader(token: string, maxAge: number): string {
+  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+async function handleBrowserLoginStart(request: Request, env: Env): Promise<Response> {
+  // Generate a CSRF state token — HMAC of a random nonce so we can verify it
+  // on callback without storing server-side state.
+  const nonce = b64url(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
+  const state = `${nonce}.${await hmac(nonce, env.UPLOAD_TOKEN_SECRET)}`;
+
+  const redirectUri = new URL("/auth/callback", new URL(request.url).origin).toString();
+  const params = new URLSearchParams({
+    client_id: env.GITHUB_CLIENT_ID,
+    redirect_uri: redirectUri,
+    scope: "read:org",
+    state,
+  });
+  const githubUrl = `https://github.com/login/oauth/authorize?${params}`;
+
+  // Stash state in a short-lived cookie so callback can verify it.
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: githubUrl,
+      "set-cookie": `__oauth_state=${encodeURIComponent(state)}; Path=/auth/callback; Max-Age=600; HttpOnly; Secure; SameSite=Lax`,
+    },
+  });
+}
+
+async function handleBrowserLoginCallback(request: Request, url: URL, env: Env): Promise<Response> {
+  const code  = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+
+  const errorPage = (msg: string) => new Response(
+    `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Login error</title>` +
+    `<style>body{font-family:sans-serif;padding:40px;color:#c0392b}</style></head>` +
+    `<body><h2>Login failed</h2><p>${esc(msg)}</p><a href="/channels">Back</a></body></html>`,
+    { status: 400, headers: { "content-type": "text/html;charset=utf-8" } }
+  );
+
+  if (!code || !state) return errorPage("Missing code or state from GitHub.");
+
+  // Verify CSRF state — check the cookie matches what we sent.
+  const cookieHeader = request.headers.get("cookie") ?? "";
+  const stateCookie = cookieHeader.split(";").map(p => p.trim())
+    .find(p => p.startsWith("__oauth_state="))
+    ?.slice("__oauth_state=".length);
+  if (!stateCookie || decodeURIComponent(stateCookie) !== state) {
+    return errorPage("State mismatch — possible CSRF. Please try logging in again.");
+  }
+  // Also verify state HMAC
+  const [nonce, sig] = state.split(".");
+  if (!nonce || !sig || sig !== await hmac(nonce, env.UPLOAD_TOKEN_SECRET)) {
+    return errorPage("Invalid state signature.");
+  }
+
+  // Exchange code for GitHub access token.
+  const origin = new URL(request.url).origin;
+  const tokenResp = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/json" },
+    body: JSON.stringify({
+      client_id: env.GITHUB_CLIENT_ID,
+      client_secret: env.GITHUB_CLIENT_SECRET,
+      code,
+      redirect_uri: `${origin}/auth/callback`,
+    }),
+  });
+  const tokenData = await tokenResp.json<{ access_token?: string; error?: string; error_description?: string }>();
+  if (!tokenData.access_token) {
+    return errorPage(`GitHub error: ${tokenData.error_description ?? tokenData.error ?? "unknown"}`);
+  }
+
+  // Fetch GitHub username.
+  const ghUser = await fetch("https://api.github.com/user", {
+    headers: { authorization: `Bearer ${tokenData.access_token}`, "user-agent": "conda-channel-server" },
+  }).then(r => r.json<{ login: string }>());
+
+  // Check org membership (same gate as Device Flow).
+  const memberCheck = await fetch(
+    `https://api.github.com/orgs/${env.GITHUB_ORG}/members/${ghUser.login}`,
+    { headers: { authorization: `Bearer ${tokenData.access_token}`, "user-agent": "conda-channel-server" } }
+  );
+  if (memberCheck.status !== 204) {
+    return errorPage(`${esc(ghUser.login)} is not a member of ${esc(env.GITHUB_ORG)}.`);
+  }
+
+  // Mint a session token (same format as upload token, longer TTL).
+  const sessionToken = await signUploadToken({ login: ghUser.login }, env.UPLOAD_TOKEN_SECRET, SESSION_TTL);
+
+  // Redirect to channels page, clear state cookie, set session cookie.
+  return new Response(null, {
+    status: 302,
+    headers: new Headers([
+      ["location", "/channels"],
+      ["set-cookie", sessionCookieHeader(sessionToken, SESSION_TTL)],
+      ["set-cookie", `__oauth_state=; Path=/auth/callback; Max-Age=0; HttpOnly; Secure; SameSite=Lax`],
+    ]),
+  });
+}
+
+function handleBrowserLogout(url: URL): Response {
+  return new Response(null, {
+    status: 302,
+    headers: new Headers([
+      ["location", "/channels"],
+      ["set-cookie", sessionCookieHeader("", 0)],
+    ]),
+  });
 }
