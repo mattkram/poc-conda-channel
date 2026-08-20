@@ -65,23 +65,49 @@ above cover it.
    confirms the object landed (a cheap `head()`, not a read of the bytes),
    then hands off to the `ChannelQueue` Durable Object for that channel and
    returns `202 Accepted` — indexing happens asynchronously from here.
-7. `ChannelQueue` records the upload and, if nothing is already scheduled,
-   sets an alarm ~5s out. Any other uploads to the same channel in that
-   window join the same batch.
-8. When the alarm fires, `ChannelQueue` sends the whole batch to the
-   container's `/ingest-batch` in one call. The container reads each
-   package's real `subdir` out of its metadata, groups files by subdir,
-   and runs one `conda-index` pass per subdir covering everything in the
-   batch — not one run per upload. This pass writes both the classic
-   monolithic `repodata.json` and [CEP-16 sharded
-   repodata](https://conda.org/learn/ceps/cep-0016/) (`repodata_shards.msgpack.zst`
-   + one content-addressed shard per package under `shards/`), so clients
-   that support shards only fetch metadata for packages they actually need,
-   while older clients still get the plain `repodata.json`.
-9. The container reports per-file success/failure. `ChannelQueue` clears
-   only the entries that succeeded; anything that failed stays queued and
-   the alarm's built-in exponential-backoff retry (a Durable Objects
-   primitive, not something we wrote) picks it up again.
+7. `ChannelQueue` records the upload and, if no alarm is already set,
+   schedules one ~5s out. Any other uploads to the same channel in that
+   window join the same batch automatically.
+8. When the alarm fires, `ChannelQueue` forwards each pending upload to
+   `PackageIngestor` (one DO instance per file), which immediately enqueues
+   it onto `ChannelIngestQueue` (one instance per channel).
+9. `ChannelIngestQueue` drains its work items one at a time, calling the
+   container's `/ingest-package` for each file. The container extracts the
+   package's real `subdir` from its metadata, moves it from `_incoming/` to
+   its final location, and writes a per-package shard + updates the shard
+   pointer for that subdir. After each successful ingest it notifies
+   `SubdirIndexMerger` for the affected subdir.
+10. `SubdirIndexMerger` (one instance per `channel/subdir`) debounces
+    `rebuild-index` calls with a ~3s window — so if five packages land in
+    `linux-64` within a few seconds, only one full conda-index rebuild runs,
+    not five. When the alarm fires it calls the container's `/rebuild-index`,
+    which merges all the per-package shards into a new
+    `repodata_shards.msgpack.zst` and regenerates the monolithic
+    `repodata.json` for that subdir.
+11. The container also writes `_browse/<name>.json` for each ingested package
+    and calls back to `POST /internal/upsert-package` on the Worker to keep
+    D1 in sync — this is what powers the browse UI and search.
+
+The only service that ever reads package bytes is the container, and it has
+to — that's what makes conda-index work.
+
+### Durable Object roles
+
+Four DOs collaborate to make the ingest pipeline serialised, batched, and
+crash-safe:
+
+| DO | Instance key | Role |
+|---|---|---|
+| `ChannelQueue` | one per channel | Debounces uploads (~5s window), owns channel `owner`/`visibility` state, prevents concurrent ingest runs |
+| `PackageIngestor` | one per `channel/filename` | Thin relay — exists so `ChannelQueue.alarm()` can fan out to multiple files in parallel without coupling directly to `ChannelIngestQueue` |
+| `ChannelIngestQueue` | one per channel | Serialises per-file container calls (one at a time), handles retries with back-off |
+| `SubdirIndexMerger` | one per `channel/subdir` | Debounces `rebuild-index` calls (~3s), coalesces multiple near-simultaneous package ingests into a single conda-index run |
+
+`PackageIngestor` is the thinnest of the four — it's a one-`fetch()` relay
+that could in theory be inlined into `ChannelQueue`. It exists as a
+separate DO so that `ChannelQueue.alarm()` can `await` multiple ingest
+dispatches without coupling its state machine directly to
+`ChannelIngestQueue`'s API.
 
 The only service that ever reads package bytes is the container in step 8,
 and it has to — that's what makes conda-index work.
@@ -150,12 +176,15 @@ wrangler deploy
   (`instance_type` in wrangler.toml), so if you have dozens of very active
   channels at once, `max_instances` on `[[containers]]` becomes the actual
   throughput limit, not this queue.
-- Upload now returns `202 Accepted`, not a final "reindexed" confirmation —
+- Upload returns `202 Accepted`, not a final "reindexed" confirmation —
   indexing is asynchronous (debounced + batched). There's currently no
   status-check endpoint for the client to poll; if you want one, a simple
   `GET /channel/<channel>/status` that reads `ChannelQueue`'s pending count
   would do it.
-- No package deletion/yanking endpoint.
+- No package deletion/yanking UI — owners can delete individual files from
+  the package detail page (`DELETE /channel/:channel/:subdir/:filename`),
+  which triggers a reindex of the affected subdir. Bulk deletion and yanking
+  (keeping the file but flagging it) are not yet implemented.
 - If ingest fails partway (e.g. `index.json` is malformed), the file is left
   under `<channel>/_incoming/` rather than silently lost — but nothing
   currently sweeps that directory, so add a periodic cleanup if failed
