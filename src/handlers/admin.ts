@@ -1,10 +1,10 @@
 import { getContainer } from "@cloudflare/containers";
-import type { Env, TrustedPublisherRow } from "./types.js";
-import { esc, channelNamespace, userWidget } from "./utils.js";
+import type { Env, TrustedPublisherRow } from "../types.js";
+import { esc, channelNamespace, userWidget } from "../utils.js";
 import { resolveLogin } from "./auth.js";
 import { CHANNEL_NAME_RE, requireChannelOwner } from "./channel.js";
 import { verifyUploadToken } from "./auth.js";
-import { BROWSE_CSS } from "./browse/ui.js";
+import { BROWSE_CSS } from "../browse/ui.js";
 
 const ADMIN_CSS = `
   .admin-section { background:#fff; border:1px solid #e4e7eb; border-radius:8px; padding:20px 24px; margin-bottom:24px; }

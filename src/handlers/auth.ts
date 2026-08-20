@@ -1,5 +1,5 @@
-import type { Env } from "./types.js";
-import { b64url, hmac } from "./utils.js";
+import type { Env } from "../types.js";
+import { b64url, hmac } from "../utils.js";
 
 export { b64url, hmac };
 

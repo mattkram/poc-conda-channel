@@ -1,7 +1,7 @@
-import type { Env, TrustedPublisherRow } from "./types.js";
+import type { Env, TrustedPublisherRow } from "../types.js";
 import { CHANNEL_NAME_RE, requireChannelOwner } from "./channel.js";
 import { resolveLogin, signUploadToken } from "./auth.js";
-import { b64url } from "./utils.js";
+import { b64url } from "../utils.js";
 
 // ---------------------------------------------------------------------------
 // OIDC exchange

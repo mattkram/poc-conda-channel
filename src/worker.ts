@@ -29,14 +29,14 @@ export { SubdirIndexMerger } from "./do/subdir-index-merger.js";
 // ---------------------------------------------------------------------------
 // Handler imports
 // ---------------------------------------------------------------------------
-import { startDeviceFlow, pollDeviceFlow, handleBrowserLoginStart, handleBrowserLoginCallback, handleBrowserLogout, resolveLogin } from "./auth.js";
-import { handleGetChannelInfo, handleSetVisibility, handleDeleteChannel } from "./channel.js";
-import { handleUploadInit, handleUploadComplete } from "./upload.js";
-import { handleOidcExchange, handleListTrustedPublishers, handleAddTrustedPublisher, handleDeleteTrustedPublisher } from "./trusted-publishers.js";
+import { startDeviceFlow, pollDeviceFlow, handleBrowserLoginStart, handleBrowserLoginCallback, handleBrowserLogout, resolveLogin } from "./handlers/auth.js";
+import { handleGetChannelInfo, handleSetVisibility, handleDeleteChannel } from "./handlers/channel.js";
+import { handleUploadInit, handleUploadComplete } from "./handlers/upload.js";
+import { handleOidcExchange, handleListTrustedPublishers, handleAddTrustedPublisher, handleDeleteTrustedPublisher } from "./handlers/trusted-publishers.js";
 import { handleHomepage, handleSearchResults, handleGlobalSearch, handleChannelsIndex, handleNamespacePage, handleBrowseResults, handleBrowsePage, handleBrowsePackage, handleR2Get, handleChannelRoot, handleDeletePackage } from "./browse/pages.js";
-import { handleAdminPage, handleRebuildBrowse } from "./admin.js";
-import { handleUpsertPackage, handleReconcile, handleMigrateR2Prefix, handleDeleteR2Prefix, handlePurgeQueue, handleAbortMultipart } from "./internal.js";
-import { verifyUploadToken } from "./auth.js";
+import { handleAdminPage, handleRebuildBrowse } from "./handlers/admin.js";
+import { handleUpsertPackage, handleReconcile, handleMigrateR2Prefix, handleDeleteR2Prefix, handlePurgeQueue, handleAbortMultipart } from "./handlers/internal.js";
+import { verifyUploadToken } from "./handlers/auth.js";
 
 // ---------------------------------------------------------------------------
 // Router

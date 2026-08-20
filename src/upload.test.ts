@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateChannelAndFilename, checkTokenScope } from "./upload.js";
+import { validateChannelAndFilename, checkTokenScope } from "./handlers/upload.js";
 
 describe("validateChannelAndFilename", () => {
   it("accepts valid bare channel + .conda file", () => {

@@ -1,5 +1,5 @@
 import { AwsClient } from "aws4fetch";
-import type { Env } from "./types.js";
+import type { Env } from "../types.js";
 import { CHANNEL_NAME_RE, checkChannelAccess } from "./channel.js";
 import { verifyUploadToken, signUploadToken } from "./auth.js";
 

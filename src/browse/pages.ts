@@ -1,16 +1,16 @@
 import { getContainer } from "@cloudflare/containers";
 import type { Env, TrustedPublisherRow } from "../types.js";
 import { esc, channelNamespace, fmtBytes, fmtDate, userWidget } from "../utils.js";
-import { resolveLogin } from "../auth.js";
+import { resolveLogin } from "../handlers/auth.js";
 import {
   CHANNEL_NAME_RE,
   checkReadAccess,
   checkChannelAccess,
   requireChannelOwner,
   browseAuth,
-} from "../channel.js";
-import { verifyUploadToken } from "../auth.js";
-import { validateChannelAndFilename } from "../upload.js";
+} from "../handlers/channel.js";
+import { verifyUploadToken } from "../handlers/auth.js";
+import { validateChannelAndFilename } from "../handlers/upload.js";
 import { BROWSE_CSS, PKG_DETAIL_CSS, HERO_CSS } from "./ui.js";
 import {
   loadBrowseIndex,

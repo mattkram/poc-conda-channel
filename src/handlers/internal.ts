@@ -1,4 +1,4 @@
-import type { Env, UpsertPackageBody } from "./types.js";
+import type { Env, UpsertPackageBody } from "../types.js";
 import { CHANNEL_NAME_RE } from "./channel.js";
 import { verifyUploadToken, resolveLogin } from "./auth.js";
 import { r2Client } from "./upload.js";

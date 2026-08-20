@@ -1,5 +1,5 @@
-import type { Env } from "./types.js";
-import { channelNamespace } from "./utils.js";
+import type { Env } from "../types.js";
+import { channelNamespace } from "../utils.js";
 import { verifyUploadToken, resolveLogin } from "./auth.js";
 
 export { channelNamespace };
