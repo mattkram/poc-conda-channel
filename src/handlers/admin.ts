@@ -4,7 +4,7 @@ import { esc, channelNamespace, userWidget } from "../utils.js";
 import { resolveLogin } from "./auth.js";
 import { CHANNEL_NAME_RE, requireChannelOwner } from "./channel.js";
 import { verifyUploadToken } from "./auth.js";
-import { BROWSE_CSS, GOOGLE_FONTS } from "../browse/ui.js";
+import { BROWSE_CSS, GOOGLE_FONTS, FAVICON_TAGS } from "../browse/ui.js";
 
 const ADMIN_CSS = `
   .admin-section { background:#fff; border:1px solid #e4e7eb; border-radius:8px; padding:20px 24px; margin-bottom:24px; }
@@ -105,6 +105,7 @@ export async function handleAdminPage(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin &middot; ${esc(channel)}</title>
 ${GOOGLE_FONTS}

@@ -13,6 +13,11 @@ export const GOOGLE_FONTS = `<link rel="preconnect" href="https://fonts.googleap
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&display=swap" rel="stylesheet">`;
 
+export const FAVICON_TAGS = `<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">`;
+
 export const PKG_DETAIL_CSS = `
   .pkg-hero { background:#fff; border:1px solid #e4e7eb; border-radius:10px; padding:24px 28px; margin-bottom:24px; }
   .pkg-title { display:flex; align-items:baseline; gap:12px; margin-bottom:8px; }

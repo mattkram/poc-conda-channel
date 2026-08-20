@@ -11,7 +11,7 @@ import {
 } from "../handlers/channel.js";
 import { verifyUploadToken } from "../handlers/auth.js";
 import { validateChannelAndFilename } from "../handlers/upload.js";
-import { BROWSE_CSS, PKG_DETAIL_CSS, HERO_CSS, GOOGLE_FONTS } from "./ui.js";
+import { BROWSE_CSS, PKG_DETAIL_CSS, HERO_CSS, GOOGLE_FONTS, FAVICON_TAGS } from "./ui.js";
 import {
   loadBrowseIndex,
   loadChannelSubdirs,
@@ -110,6 +110,7 @@ export async function handleHomepage(request: Request, url: URL, env: Env): Prom
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Search and browse conda packages across all channels.">
 <title>conda-wit</title>
@@ -232,6 +233,7 @@ export async function handleGlobalSearch(request: Request, url: URL, env: Env): 
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${q ? `${esc(q)} &middot; ` : ""}Search &middot; conda-wit</title>
 ${GOOGLE_FONTS}
@@ -311,6 +313,7 @@ export async function handleChannelsIndex(request: Request, env: Env): Promise<R
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Browse all conda channels hosted on this server.">
 <title>Channels &middot; conda-wit</title>
@@ -365,6 +368,7 @@ export async function handleNamespacePage(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Channels owned by ${esc(namespace)}.">
 <title>${esc(namespace)} &middot; channels</title>
@@ -460,6 +464,7 @@ export async function handleBrowsePage(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Browse packages in the ${esc(channel)} conda channel. Search, filter, and install packages.">
 <title>${esc(channel)} &middot; packages</title>
@@ -597,6 +602,7 @@ export async function handleBrowsePackage(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="${esc(rec.summary || `${name} package in the ${channel} conda channel`)}">
 <title>${esc(name)} &middot; ${esc(channel)}</title>
