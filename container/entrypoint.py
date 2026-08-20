@@ -346,13 +346,9 @@ def ingest_package(channel: str, filename: str, staging_key: str) -> dict:
         existing_browse = json.loads(
             s3.get_object(Bucket=BUCKET, Key=browse_key)["Body"].read()
         )
+        # Merge subdirs from the existing record — this package may exist in
+        # multiple subdirs across separate uploads.
         subdirs_seen |= set(existing_browse.get("subdirs", []))
-        # Keep the highest version seen for the listing row.
-        if existing_browse.get("version", "") > (browse.get("version") or ""):
-            browse["version"] = existing_browse["version"]
-            browse["summary"] = existing_browse.get("summary", browse.get("summary", ""))
-            browse["license"] = existing_browse.get("license", browse.get("license", ""))
-            browse["home"] = existing_browse.get("home", browse.get("home", ""))
     except botocore.exceptions.ClientError as e:
         if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
             raise
