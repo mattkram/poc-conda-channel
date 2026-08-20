@@ -1013,7 +1013,12 @@ async function handleSearchResults(request: Request, url: URL, env: Env): Promis
   const q = url.searchParams.get("q")?.trim() ?? "";
 
   if (!q) {
-    return new Response("", { headers: { "content-type": "text/html;charset=utf-8" } });
+    return new Response("", {
+      headers: {
+        "content-type": "text/html;charset=utf-8",
+        "HX-Push-Url": "/",
+      },
+    });
   }
 
   const { results: channels } = await env.DB.prepare(
@@ -1065,7 +1070,12 @@ async function handleSearchResults(request: Request, url: URL, env: Env): Promis
       <tbody>${tableRows}</tbody>
     </table>`;
 
-  return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
+  return new Response(html, {
+    headers: {
+      "content-type": "text/html;charset=utf-8",
+      "HX-Push-Url": q ? `/search?q=${encodeURIComponent(q)}` : "/",
+    },
+  });
 }
 
 async function handleHomepage(request: Request, url: URL, env: Env): Promise<Response> {
@@ -1114,7 +1124,6 @@ async function handleHomepage(request: Request, url: URL, env: Env): Promise<Res
         hx-get="/search/results"
         hx-trigger="input changed delay:300ms from:input[name='q'], submit"
         hx-target="#search-results"
-        hx-push-url="/search?q={q}"
         action="/search" method="GET">
     <input type="search" name="q" value="${esc(q)}"
            placeholder="Search packages&hellip;"
