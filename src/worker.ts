@@ -367,9 +367,13 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // Homepage → channels listing.
+    // Homepage — hero search + channel list.
     if (url.pathname === "/" && request.method === "GET") {
-      return Response.redirect(new URL("/channels", url).toString(), 302);
+      return handleHomepage(request, url, env);
+    }
+
+    if (url.pathname === "/search/results" && request.method === "GET") {
+      return handleSearchResults(request, url, env);
     }
 
     if (url.pathname === "/auth/device/start" && request.method === "POST") {
@@ -974,6 +978,175 @@ async function browseAuth(request: Request, channel: string, env: Env): Promise<
   if (!CHANNEL_NAME_RE.test(channel)) return new Response("not found", { status: 404 });
   const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
   return checkReadAccess(channel, login, env);
+}
+
+// ---------------------------------------------------------------------------
+// Homepage — hero search + channel list
+// ---------------------------------------------------------------------------
+
+const HERO_CSS = `
+  .hero { background:#fff; border-bottom:1px solid #e4e7eb; padding:64px 24px 48px; text-align:center; }
+  .hero h1 { margin:0 0 8px; font-size:32px; font-weight:800; color:#1f2933; letter-spacing:-0.5px; }
+  .hero p { margin:0 0 32px; color:#52606d; font-size:16px; }
+  .hero-search-wrap { max-width:640px; margin:0 auto; display:flex; gap:0; box-shadow:0 2px 12px rgba(0,0,0,.1); border-radius:10px; overflow:hidden; }
+  .hero-search-wrap input[type=search] { flex:1; padding:16px 20px; border:none; font-size:16px; outline:none; color:#1f2933; min-width:0; }
+  .hero-search-wrap button { padding:0 28px; background:#2d7a1f; color:#fff; border:none; font-size:15px; font-weight:700; cursor:pointer; white-space:nowrap; }
+  .hero-search-wrap button:hover { background:#246018; }
+  #search-results { max-width:960px; margin:0 auto; padding:0 24px; }
+  .results-table { width:100%; border-collapse:collapse; font-size:14px; margin-top:8px; }
+  .results-table th { text-align:left; padding:8px 12px; color:#52606d; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; border-bottom:2px solid #e4e7eb; }
+  .results-table td { padding:10px 12px; border-bottom:1px solid #f0f2f5; vertical-align:middle; }
+  .results-table tr:last-child td { border-bottom:none; }
+  .results-table tr:hover td { background:#fafbfc; }
+  .results-table a.pkg-link { font-weight:600; color:#1f6f18; text-decoration:none; font-size:15px; }
+  .results-table a.pkg-link:hover { text-decoration:underline; }
+  .results-table .pkg-summary { color:#52606d; font-size:13px; }
+  .results-table .chan-link { color:#9aacb8; font-size:12px; text-decoration:none; }
+  .results-table .chan-link:hover { color:#2d7a1f; text-decoration:underline; }
+  .results-count { color:#52606d; font-size:13px; padding:12px 0 4px; }
+  .channels-section { max-width:960px; margin:32px auto 0; padding:0 24px 48px; }
+  .channels-section h2 { font-size:16px; font-weight:700; color:#52606d; text-transform:uppercase; letter-spacing:.06em; margin:0 0 14px; }
+`;
+
+async function handleSearchResults(request: Request, url: URL, env: Env): Promise<Response> {
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
+  const q = url.searchParams.get("q")?.trim() ?? "";
+
+  if (!q) {
+    return new Response("", { headers: { "content-type": "text/html;charset=utf-8" } });
+  }
+
+  const { results: channels } = await env.DB.prepare(
+    `SELECT name, owner, visibility FROM channels`
+  ).all<{ name: string; owner: string | null; visibility: string }>();
+  const visible = new Set(
+    channels.filter(c => c.visibility === "public" || c.owner === login).map(c => c.name)
+  );
+
+  const { results } = await env.DB.prepare(
+    `SELECT p.channel, p.name, p.version, p.summary, p.subdirs
+     FROM packages_fts f
+     JOIN packages p ON p.rowid = f.rowid
+     WHERE packages_fts MATCH ?
+     ORDER BY p.name ASC
+     LIMIT 50`
+  ).bind(`"${q.replace(/"/g, '""')}"*`).all<{
+    channel: string; name: string; version: string; summary: string; subdirs: string;
+  }>();
+
+  const rows = results.filter(r => visible.has(r.channel));
+
+  if (rows.length === 0) {
+    return new Response(
+      `<div class="results-count">No packages match &ldquo;${esc(q)}&rdquo;.</div>`,
+      { headers: { "content-type": "text/html;charset=utf-8" } }
+    );
+  }
+
+  const tableRows = rows.map(r => {
+    const subdirs: string[] = JSON.parse(r.subdirs ?? "[]");
+    const ns = channelNamespace(r.channel);
+    const chanDisplay = ns
+      ? `${esc(ns)}/${esc(r.channel.slice(ns.length + 1))}`
+      : esc(r.channel);
+    return `<tr>
+      <td><a class="pkg-link" href="/channels/${esc(r.channel)}/package/${encodeURIComponent(r.name)}">${esc(r.name)}</a></td>
+      <td class="pkg-summary">${esc(r.summary ?? "")}</td>
+      <td>${subdirs.map(s => `<span class="badge">${esc(s)}</span>`).join(" ")}</td>
+      <td><a class="chan-link" href="/channels/${esc(r.channel)}">${chanDisplay}</a></td>
+      <td style="color:#52606d;font-size:13px">${esc(r.version)}</td>
+    </tr>`;
+  }).join("");
+
+  const html = `
+    <div class="results-count">${rows.length} result${rows.length === 1 ? "" : "s"}</div>
+    <table class="results-table">
+      <thead><tr><th>Package</th><th>Summary</th><th>Platforms</th><th>Channel</th><th>Version</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table>`;
+
+  return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
+}
+
+async function handleHomepage(request: Request, url: URL, env: Env): Promise<Response> {
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
+  const q = url.searchParams.get("q")?.trim() ?? "";
+
+  // Channel cards for the below-fold list.
+  const { results } = await env.DB.prepare(
+    `SELECT name, owner, visibility FROM channels ORDER BY name`
+  ).all<{ name: string; owner: string | null; visibility: string }>();
+  const visible = results.filter(c => c.visibility === "public" || c.owner === login);
+
+  const chanCards = visible.map(ch => {
+    const ns = channelNamespace(ch.name);
+    const displayName = ns
+      ? `<span style="color:#9aacb8">${esc(ns)}/</span>${esc(ch.name.slice(ns.length + 1))}`
+      : esc(ch.name);
+    const lock = ch.visibility === "private" ? ' <span class="lock-badge">🔒 private</span>' : "";
+    return `<div class="pkg">
+      <a class="name" href="/channels/${ch.name}">${displayName}</a>${lock}
+      <div class="meta">${ch.owner ? `<span>owner: ${esc(ch.owner)}</span>` : ""}<span>conda channel</span></div>
+    </div>`;
+  }).join("");
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Search and browse conda packages across all channels.">
+<title>conda-channel-server</title>
+<script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+<style>${BROWSE_CSS}${HERO_CSS}</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="/">conda-channel-server</a>
+  <span class="chan-sep">/</span><a class="chan" href="/channels" style="text-decoration:none">channels</a>
+  ${userWidget(login)}
+</header>
+
+<div class="hero">
+  <h1>Find conda packages</h1>
+  <p>Search across all public channels hosted on this server.</p>
+  <form class="hero-search-wrap"
+        hx-get="/search/results"
+        hx-trigger="input changed delay:300ms from:input[name='q'], submit"
+        hx-target="#search-results"
+        hx-push-url="/search?q={q}"
+        action="/search" method="GET">
+    <input type="search" name="q" value="${esc(q)}"
+           placeholder="Search packages&hellip;"
+           autocomplete="off" autofocus
+           aria-label="Search packages">
+    <button type="submit">Search</button>
+  </form>
+</div>
+
+<div id="search-results">${q ? `<div style="text-align:center;padding:32px;color:#9aacb8">Loading…</div>
+<script>htmx.ajax('GET','/search/results?q=${encodeURIComponent(q)}',{target:'#search-results'})</script>` : ""}</div>
+
+<div class="channels-section" id="channel-list"${q ? ' style="display:none"' : ""}>
+  <h2>${visible.length} channel${visible.length === 1 ? "" : "s"}</h2>
+  ${chanCards || `<div class="empty">No channels yet.</div>`}
+</div>
+
+<script>
+// Show channel list when search is cleared, hide when typing.
+document.addEventListener('htmx:afterSettle', () => {
+  const q = document.querySelector('input[name="q"]')?.value?.trim();
+  const cl = document.getElementById('channel-list');
+  if (cl) cl.style.display = q ? 'none' : '';
+});
+document.querySelector('input[name="q"]')?.addEventListener('input', function() {
+  const cl = document.getElementById('channel-list');
+  if (cl) cl.style.display = this.value.trim() ? 'none' : '';
+});
+</script>
+</body>
+</html>`;
+  return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
 }
 
 // GET /search?q= — cross-channel package search across all public channels.
