@@ -5,7 +5,8 @@
 GITHUB_CLIENT_ID=
 GITHUB_CLIENT_SECRET=
 GITHUB_ORG=
-UPLOAD_TOKEN_SECRET=
+UPLOAD_TOKEN_SECRET=       # any random 32+ byte string, e.g. $(openssl rand -hex 16)
+INTERNAL_SECRET=           # any random 32+ byte string, e.g. $(openssl rand -hex 16)
 R2_ACCESS_KEY_ID=
 R2_SECRET_ACCESS_KEY=
 R2_ACCOUNT_ID=
