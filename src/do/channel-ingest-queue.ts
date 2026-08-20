@@ -3,6 +3,8 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env, PendingUpload } from "../types.js";
 
 const INGEST_QUEUE_DRAIN_MS = 100;
+// Back-off when the container platform has no capacity.
+const CONTAINER_UNAVAILABLE_RETRY_MS = 15_000;
 
 export class ChannelIngestQueue extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
@@ -32,15 +34,26 @@ export class ChannelIngestQueue extends DurableObject<Env> {
     const [[key, upload]] = list.entries();
     const { channel, filename } = upload;
 
-    const container = getContainer(this.env.INDEXER, channel);
-    const stagingKey = `${channel}/_incoming/${filename}`;
-    const resp = await container.fetch("http://container/ingest-package", {
-      method: "POST",
-      body: JSON.stringify({ channel, filename, staging_key: stagingKey }),
-      headers: { "content-type": "application/json" },
-    });
+    let resp: Response;
+    try {
+      const container = getContainer(this.env.INDEXER, channel);
+      const stagingKey = `${channel}/_incoming/${filename}`;
+      resp = await container.fetch("http://container/ingest-package", {
+        method: "POST",
+        body: JSON.stringify({ channel, filename, staging_key: stagingKey }),
+        headers: { "content-type": "application/json" },
+      });
+    } catch (err: unknown) {
+      // Container platform unavailable — back off and retry the whole queue.
+      const msg = err instanceof Error ? err.message : String(err);
+      const isCapacity = msg.includes("no container instance") || msg.includes("try again later");
+      const retryMs = isCapacity ? CONTAINER_UNAVAILABLE_RETRY_MS : 60_000;
+      await this.ctx.storage.setAlarm(Date.now() + retryMs);
+      return;
+    }
 
     if (!resp.ok) {
+      // Container returned an error — requeue with a delay.
       const retryKey = `work:${String(Date.now() + 60_000).padStart(15, "0")}:${filename}`;
       await this.ctx.storage.put(retryKey, upload);
       await this.ctx.storage.delete(key);
