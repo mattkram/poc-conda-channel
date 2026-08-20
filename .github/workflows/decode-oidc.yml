@@ -1,5 +1,7 @@
 name: Decode OIDC
-on: workflow_dispatch
+on:
+  push:
+    branches: [main]
 permissions:
   id-token: write
   contents: read
