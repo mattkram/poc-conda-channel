@@ -8,6 +8,7 @@ compatibility_flags = ["nodejs_compat"]
 [assets]
 directory = "./public"
 binding = "ASSETS"
+not_found_handling = "pass-through"
 
 [observability]
 enabled = true
