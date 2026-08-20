@@ -2,10 +2,13 @@
 // Shared types used across modules.
 // ---------------------------------------------------------------------------
 
+import type { Container } from "@cloudflare/containers";
+
 export interface Env {
   CHANNEL_BUCKET: R2Bucket;
   DB: D1Database;
-  INDEXER: DurableObjectNamespace;
+  // INDEXER is a Container DO — typed precisely so getContainer() calls type-check.
+  INDEXER: DurableObjectNamespace<Container<Env>>;
   QUEUE: DurableObjectNamespace;
   INGESTOR: DurableObjectNamespace;
   MERGER: DurableObjectNamespace;
@@ -14,8 +17,8 @@ export interface Env {
   GITHUB_CLIENT_SECRET: string;
   GITHUB_ORG: string;
   UPLOAD_TOKEN_SECRET: string;
-  INTERNAL_SECRET: string;   // shared secret for container→worker callbacks
-  SUPERADMIN_LOGIN: string;  // GitHub login of the superadmin (e.g. "mattkram")
+  INTERNAL_SECRET: string;
+  SUPERADMIN_LOGIN: string;
   R2_ACCESS_KEY_ID: string;
   R2_SECRET_ACCESS_KEY: string;
   R2_ACCOUNT_ID: string;

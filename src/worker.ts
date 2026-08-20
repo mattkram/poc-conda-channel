@@ -1,6 +1,8 @@
 import { Container } from "@cloudflare/containers";
-import { env } from "cloudflare:workers";
+import { env as _moduleEnv } from "cloudflare:workers";
 import type { Env } from "./types.js";
+
+const _env = _moduleEnv as unknown as Env;
 
 // ---------------------------------------------------------------------------
 // Container DO — must be exported from the entrypoint for wrangler to find it.
@@ -9,12 +11,12 @@ export class IndexerContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = "2m";
   envVars = {
-    R2_ACCOUNT_ID: env.R2_ACCOUNT_ID,
-    R2_ACCESS_KEY_ID: env.R2_ACCESS_KEY_ID,
-    R2_SECRET_ACCESS_KEY: env.R2_SECRET_ACCESS_KEY,
-    R2_BUCKET_NAME: env.R2_BUCKET_NAME,
+    R2_ACCOUNT_ID: _env.R2_ACCOUNT_ID,
+    R2_ACCESS_KEY_ID: _env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: _env.R2_SECRET_ACCESS_KEY,
+    R2_BUCKET_NAME: _env.R2_BUCKET_NAME,
     WORKER_URL: "https://conda.matt-kramer.com",
-    INTERNAL_SECRET: env.INTERNAL_SECRET,
+    INTERNAL_SECRET: _env.INTERNAL_SECRET,
   };
 }
 
