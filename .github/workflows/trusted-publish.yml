@@ -1,0 +1,159 @@
+name: Trusted Publish
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write   # required to request a GitHub Actions OIDC token
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: production   # optional — remove if you don't use GH environments
+
+    env:
+      CHANNEL_SERVER: https://conda.matt-kramer.com
+      CHANNEL: mattkram/trusted-publishing-test
+      PACKAGE_NAME: test-trusted-publishing
+      VERSION: "0.1.${{ github.run_number }}"
+      SUBDIR: noarch
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Build a minimal .conda package from scratch ──────────────────────
+      # A .conda file is a ZIP of two zstd-compressed tarballs:
+      #   pkg-<name>-<ver>-<build>.tar.zst   — (empty payload)
+      #   info-<name>-<ver>-<build>.tar.zst  — info/index.json, info/paths.json, info/about.json
+      - name: Build .conda package
+        run: |
+          set -euo pipefail
+          pip install zstandard --quiet
+
+          PKG_NAME="${PACKAGE_NAME}"
+          VERSION="${VERSION}"
+          BUILD="0"
+          BUILD_STEM="${PKG_NAME}-${VERSION}-${BUILD}"
+
+          WORK=$(mktemp -d)
+
+          # --- info tarball ---
+          INFO_DIR="${WORK}/info_root/info"
+          mkdir -p "${INFO_DIR}"
+
+          cat > "${INFO_DIR}/index.json" <<EOF
+          {
+            "name": "${PKG_NAME}",
+            "version": "${VERSION}",
+            "build": "${BUILD}",
+            "build_number": 0,
+            "subdir": "noarch",
+            "depends": [],
+            "noarch": "generic"
+          }
+          EOF
+
+          cat > "${INFO_DIR}/paths.json" <<EOF
+          {"paths_version": 1, "paths": []}
+          EOF
+
+          cat > "${INFO_DIR}/about.json" <<EOF
+          {
+            "summary": "Minimal test package for trusted publishing CI",
+            "home": "https://github.com/${{ github.repository }}"
+          }
+          EOF
+
+          # Compress info tarball with zstd
+          python3 - <<'PYEOF'
+          import tarfile, zstandard, pathlib, os
+
+          work = os.environ["WORK"]
+          build_stem = os.environ["BUILD_STEM"]
+
+          # info tarball
+          info_tar = f"{work}/info-{build_stem}.tar"
+          with tarfile.open(info_tar, "w") as t:
+              t.add(f"{work}/info_root/info", arcname="info")
+          cctx = zstandard.ZstdCompressor(level=3)
+          with open(info_tar, "rb") as src, open(f"{work}/info-{build_stem}.tar.zst", "wb") as dst:
+              cctx.copy_stream(src, dst)
+
+          # pkg tarball (empty)
+          pkg_tar = f"{work}/pkg-{build_stem}.tar"
+          with tarfile.open(pkg_tar, "w") as t:
+              pass  # no payload files
+          with open(pkg_tar, "rb") as src, open(f"{work}/pkg-{build_stem}.tar.zst", "wb") as dst:
+              cctx.copy_stream(src, dst)
+
+          # assemble .conda zip
+          import zipfile
+          conda_path = f"{build_stem}.conda"
+          with zipfile.ZipFile(conda_path, "w", compression=zipfile.ZIP_STORED) as zf:
+              zf.write(f"{work}/pkg-{build_stem}.tar.zst",  f"pkg-{build_stem}.tar.zst")
+              zf.write(f"{work}/info-{build_stem}.tar.zst", f"info-{build_stem}.tar.zst")
+          print(f"Built: {conda_path}")
+          PYEOF
+        env:
+          WORK: /tmp/conda-build
+          BUILD_STEM: "${{ env.PACKAGE_NAME }}-${{ env.VERSION }}-0"
+
+      # ── Exchange OIDC token for a scoped upload token ─────────────────────
+      - name: Get OIDC token and exchange for upload token
+        id: get_token
+        run: |
+          set -euo pipefail
+
+          # Request the OIDC JWT from GitHub's token endpoint.
+          # The 'audience' must match the value your Worker expects (conda-channel-server).
+          OIDC_TOKEN=$(curl -fsSL \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=conda-channel-server" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+
+          # Exchange OIDC token for a scoped upload token
+          RESPONSE=$(curl -fsSL -X POST "${CHANNEL_SERVER}/upload/exchange-oidc" \
+            -H "Content-Type: application/json" \
+            -d "{\"oidc_token\": \"${OIDC_TOKEN}\", \"channel\": \"${CHANNEL}\"}")
+
+          UPLOAD_TOKEN=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['upload_token'])")
+
+          # Mask the token in logs
+          echo "::add-mask::${UPLOAD_TOKEN}"
+          echo "upload_token=${UPLOAD_TOKEN}" >> "${GITHUB_OUTPUT}"
+
+      # ── Upload the package ────────────────────────────────────────────────
+      - name: Upload package
+        run: |
+          set -euo pipefail
+
+          FILENAME="${PACKAGE_NAME}-${VERSION}-0.conda"
+          UPLOAD_TOKEN="${{ steps.get_token.outputs.upload_token }}"
+
+          echo "Uploading ${FILENAME} to channel ${CHANNEL} ..."
+
+          # Step 1: get presigned PUT URL
+          INIT_RESP=$(curl -fsSL -X POST "${CHANNEL_SERVER}/upload/init" \
+            -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"channel\": \"${CHANNEL}\", \"filename\": \"${FILENAME}\"}")
+
+          UPLOAD_URL=$(echo "${INIT_RESP}" | python3 -c "import sys,json; print(json.load(sys.stdin)['upload_url'])")
+
+          # Step 2: PUT the package directly to R2
+          curl -fsSL -X PUT "${UPLOAD_URL}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@${FILENAME}"
+
+          # Step 3: notify the Worker the upload is complete
+          curl -fsSL -X POST "${CHANNEL_SERVER}/upload/complete" \
+            -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"channel\": \"${CHANNEL}\", \"filename\": \"${FILENAME}\"}"
+
+          echo "Upload complete. Indexing is async — check ${CHANNEL_SERVER}/channels/${CHANNEL} in ~10s."
