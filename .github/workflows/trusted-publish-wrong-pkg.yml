@@ -1,0 +1,123 @@
+name: Trusted Publish - Wrong Package (expected failure)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish-wrong-pkg:
+    runs-on: ubuntu-latest
+
+    env:
+      CHANNEL_SERVER: https://conda.matt-kramer.com
+      CHANNEL: mattkram/trusted-publishing-test
+      # Intentionally different from the scoped package name in the trusted
+      # publisher rule (test-trusted-publishing), so the upload should be
+      # rejected with 403 after a successful OIDC exchange.
+      PACKAGE_NAME: evil-package
+      VERSION: "0.1.${{ github.run_number }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build .conda package (wrong name)
+        run: |
+          set -euo pipefail
+          pip install zstandard --quiet
+
+          BUILD_STEM="${PACKAGE_NAME}-${VERSION}-0"
+          WORK=$(mktemp -d)
+          mkdir -p "${WORK}/info_root/info"
+
+          cat > "${WORK}/info_root/info/index.json" <<EOF
+          {
+            "name": "${PACKAGE_NAME}",
+            "version": "${VERSION}",
+            "build": "0",
+            "build_number": 0,
+            "subdir": "noarch",
+            "depends": [],
+            "noarch": "generic"
+          }
+          EOF
+          cat > "${WORK}/info_root/info/paths.json" <<'EOF'
+          {"paths_version": 1, "paths": []}
+          EOF
+          cat > "${WORK}/info_root/info/about.json" <<EOF
+          {"summary": "Package that should be rejected by token scope check"}
+          EOF
+
+          python3 - "${WORK}" "${BUILD_STEM}" <<'PYEOF'
+          import sys, tarfile, zipfile, zstandard
+          work, build_stem = sys.argv[1], sys.argv[2]
+          cctx = zstandard.ZstdCompressor(level=3)
+          info_tar = f"{work}/info-{build_stem}.tar"
+          with tarfile.open(info_tar, "w") as t:
+              t.add(f"{work}/info_root/info", arcname="info")
+          with open(info_tar, "rb") as src, open(f"{work}/info-{build_stem}.tar.zst", "wb") as dst:
+              cctx.copy_stream(src, dst)
+          pkg_tar = f"{work}/pkg-{build_stem}.tar"
+          with tarfile.open(pkg_tar, "w"):
+              pass
+          with open(pkg_tar, "rb") as src, open(f"{work}/pkg-{build_stem}.tar.zst", "wb") as dst:
+              cctx.copy_stream(src, dst)
+          conda_path = f"{build_stem}.conda"
+          with zipfile.ZipFile(conda_path, "w", compression=zipfile.ZIP_STORED) as zf:
+              zf.write(f"{work}/pkg-{build_stem}.tar.zst",  f"pkg-{build_stem}.tar.zst")
+              zf.write(f"{work}/info-{build_stem}.tar.zst", f"info-{build_stem}.tar.zst")
+          print(f"Built: {conda_path}")
+          PYEOF
+
+      - name: Exchange OIDC token (should succeed — rule matches workflow)
+        id: get_token
+        run: |
+          set -euo pipefail
+          OIDC_TOKEN=$(curl -sSL \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=conda-channel-server" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+
+          RESPONSE=$(curl -sSL -w "\n%{http_code}" -X POST "${CHANNEL_SERVER}/upload/exchange-oidc" \
+            -H "Content-Type: application/json" \
+            -d "{\"oidc_token\": \"${OIDC_TOKEN}\", \"channel\": \"${CHANNEL}\"}")
+          HTTP_CODE=$(echo "${RESPONSE}" | tail -1)
+          BODY=$(echo "${RESPONSE}" | head -n -1)
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "exchange-oidc failed unexpectedly (HTTP ${HTTP_CODE}): ${BODY}"
+            exit 1
+          fi
+
+          echo "OIDC exchange succeeded (expected) — token is scoped to test-trusted-publishing"
+          UPLOAD_TOKEN=$(echo "${BODY}" | python3 -c "import sys,json; print(json.load(sys.stdin)['upload_token'])")
+          echo "::add-mask::${UPLOAD_TOKEN}"
+          echo "upload_token=${UPLOAD_TOKEN}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attempt upload/init with wrong package (should be rejected 403)
+        run: |
+          set -euo pipefail
+          FILENAME="${PACKAGE_NAME}-${VERSION}-0.conda"
+          UPLOAD_TOKEN="${{ steps.get_token.outputs.upload_token }}"
+
+          RESPONSE=$(curl -sSL -w "\n%{http_code}" -X POST "${CHANNEL_SERVER}/upload/init" \
+            -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"channel\": \"${CHANNEL}\", \"filename\": \"${FILENAME}\"}")
+          HTTP_CODE=$(echo "${RESPONSE}" | tail -1)
+          BODY=$(echo "${RESPONSE}" | head -n -1)
+
+          echo "upload/init response: HTTP ${HTTP_CODE} — ${BODY}"
+
+          if [ "${HTTP_CODE}" = "403" ]; then
+            echo "PASS: server correctly rejected upload of '${PACKAGE_NAME}' with a token scoped to 'test-trusted-publishing'"
+          else
+            echo "FAIL: expected 403 but got ${HTTP_CODE}"
+            exit 1
+          fi
