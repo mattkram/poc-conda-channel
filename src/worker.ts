@@ -397,6 +397,11 @@ export default {
       return handleOidcExchange(request, env);
     }
 
+    // Global search
+    if (url.pathname === "/search" && request.method === "GET") {
+      return handleGlobalSearch(request, url, env);
+    }
+
     // --- UI pages under /channels ---
     if (url.pathname === "/channels" || url.pathname === "/channels/") {
       return handleChannelsIndex(request, env);
@@ -729,6 +734,22 @@ async function handleR2Get(request: Request, channel: string, key: string, env: 
   const headers = new Headers();
   obj.writeHttpMetadata(headers);
   headers.set("etag", obj.httpEtag);
+  // Cache-Control: immutable for content-addressed / package files; short TTL
+  // for repodata (conda clients poll this to discover new packages).
+  const leaf = key.split("/").pop() ?? "";
+  if (leaf.endsWith(".conda") || leaf.endsWith(".tar.bz2")) {
+    // Package files are immutable once uploaded — cache forever at edge.
+    headers.set("cache-control", "public, max-age=31536000, immutable");
+  } else if (leaf.endsWith(".msgpack.zst") || leaf.endsWith(".zst")) {
+    // Content-addressed shards are also immutable.
+    headers.set("cache-control", "public, max-age=31536000, immutable");
+  } else if (leaf === "repodata.json" || leaf === "repodata_from_packages.json") {
+    // Repodata changes on every upload — short TTL so conda clients see updates.
+    headers.set("cache-control", "public, max-age=300, must-revalidate");
+  } else {
+    // Everything else (index.html, current_repodata.json, etc.) — 60s.
+    headers.set("cache-control", "public, max-age=60");
+  }
   return new Response(obj.body, { headers });
 }
 
@@ -821,6 +842,10 @@ const BROWSE_CSS = `
   .empty { color: #3d4f5c; padding: 40px; text-align: center; }
   code { background: #f0f2f5; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
   .lock-badge { background: #fdecea; color: #b42318; border-radius: 4px; padding: 2px 8px; font-size: 12px; margin-left: 4px; }
+  .subdir-bar { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:14px; }
+  .subdir-pill { padding:4px 12px; border-radius:20px; border:1px solid #cbd2d9; font-size:12px; font-weight:600; color:#3d4f5c; text-decoration:none; background:#fff; }
+  .subdir-pill:hover { border-color:#2d7a1f; color:#2d7a1f; }
+  .subdir-pill.active { background:#2d7a1f; color:#fff; border-color:#2d7a1f; }
 `;
 
 function esc(s: string): string {
@@ -839,24 +864,37 @@ function userWidget(login: string | null): string {
   </div>`;
 }
 
-async function loadBrowseIndex(channel: string, env: Env, q?: string, sort?: string): Promise<BrowseRecord[]> {
+// Collect all distinct subdirs across packages in a channel, sorted.
+async function loadChannelSubdirs(channel: string, env: Env): Promise<string[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT subdirs FROM packages WHERE channel = ?`
+  ).bind(channel).all<{ subdirs: string }>();
+  const set = new Set<string>();
+  for (const r of results) {
+    for (const s of JSON.parse(r.subdirs ?? "[]") as string[]) set.add(s);
+  }
+  return [...set].sort();
+}
+
+async function loadBrowseIndex(channel: string, env: Env, q?: string, sort?: string, subdir?: string): Promise<BrowseRecord[]> {
   // Use D1 for fast filtered queries when possible.
   const sortCol = sort === "name-desc" ? "name DESC" : "name ASC";
   let stmt: D1PreparedStatement;
+  const subdirFilter = subdir ? ` AND p.subdirs LIKE ?` : "";
+  const subdirParam = subdir ? `%"${subdir}"%` : undefined;
   if (q) {
-    // FTS match — join back to packages for the full row.
     stmt = env.DB.prepare(
       `SELECT p.name, p.version, p.summary, p.license, p.home, p.subdirs
        FROM packages_fts f
        JOIN packages p ON p.rowid = f.rowid
-       WHERE p.channel = ? AND packages_fts MATCH ?
+       WHERE p.channel = ? AND packages_fts MATCH ?${subdirFilter.replace("p.", "")}
        ORDER BY p.${sortCol}`
-    ).bind(channel, `"${q.replace(/"/g, '""')}"*`);
+    ).bind(channel, `"${q.replace(/"/g, '""')}"*`, ...(subdirParam ? [subdirParam] : []));
   } else {
     stmt = env.DB.prepare(
       `SELECT name, version, summary, license, home, subdirs
-       FROM packages WHERE channel = ? ORDER BY ${sortCol}`
-    ).bind(channel);
+       FROM packages WHERE channel = ?${subdir ? ` AND subdirs LIKE ?` : ""} ORDER BY ${sortCol}`
+    ).bind(channel, ...(subdirParam ? [subdirParam] : []));
   }
   const { results } = await stmt.all<{
     name: string; version: string; summary: string;
@@ -871,7 +909,7 @@ function filterSort(records: BrowseRecord[], q: string, sort: string): BrowseRec
   return records;
 }
 
-function renderResults(channel: string, records: BrowseRecord[], q: string, sort: string, page: number): string {
+function renderResults(channel: string, records: BrowseRecord[], q: string, sort: string, page: number, activeSubdir?: string, allSubdirs?: string[]): string {
   const total = records.length;
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const cur = Math.min(Math.max(1, page), pages);
@@ -888,27 +926,34 @@ function renderResults(channel: string, records: BrowseRecord[], q: string, sort
           ${(r.subdirs ?? []).map((s) => `<span class="badge">${esc(s)}</span>`).join(" ")}
         </div>
       </div>`).join("")
-    : `<div class="empty">No packages match &ldquo;${esc(q)}&rdquo;.</div>`;
+    : `<div class="empty">No packages${q ? ` match &ldquo;${esc(q)}&rdquo;` : ""}${activeSubdir ? ` in <strong>${esc(activeSubdir)}</strong>` : ""}.</div>`;
 
-  const canonicalQs = (p: number) => {
+  const canonicalQs = (p: number, sd?: string) => {
     const params = new URLSearchParams();
     if (q) params.set("q", q);
     if (sort !== "name-asc") params.set("sort", sort);
+    if (sd) params.set("subdir", sd);
     if (p > 1) params.set("page", String(p));
     const s = params.toString();
     return s ? "?" + s : "";
   };
-  // /results always needs all params for the server to render correctly
   const resultsQs = (p: number) =>
-    `?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&page=${p}`;
-  const pager = pages > 1 ? `
-    <div class="pager">
-      ${cur > 1 ? `<a href="/channels/${channel}${canonicalQs(cur - 1)}" hx-get="/channels/${channel}/results${resultsQs(cur - 1)}" hx-target="#results" hx-push-url="/channels/${channel}${canonicalQs(cur - 1)}">&lsaquo; Prev</a>` : ""}
-      <span class="cur">${cur} / ${pages}</span>
-      ${cur < pages ? `<a href="/channels/${channel}${canonicalQs(cur + 1)}" hx-get="/channels/${channel}/results${resultsQs(cur + 1)}" hx-target="#results" hx-push-url="/channels/${channel}${canonicalQs(cur + 1)}">Next &rsaquo;</a>` : ""}
+    `?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&page=${p}${activeSubdir ? `&subdir=${encodeURIComponent(activeSubdir)}` : ""}`;
+
+  const subdirBar = allSubdirs && allSubdirs.length > 1 ? `
+    <div class="subdir-bar">
+      <a class="subdir-pill${!activeSubdir ? " active" : ""}" href="/channels/${channel}${canonicalQs(1)}">All</a>
+      ${allSubdirs.map((s) => `<a class="subdir-pill${activeSubdir === s ? " active" : ""}" href="/channels/${channel}${canonicalQs(1, s)}">${esc(s)}</a>`).join("")}
     </div>` : "";
 
-  return `<div class="count">${total} package${total === 1 ? "" : "s"}</div>${rows}${pager}`;
+  const pager = pages > 1 ? `
+    <div class="pager">
+      ${cur > 1 ? `<a href="/channels/${channel}${canonicalQs(cur - 1, activeSubdir)}" hx-get="/channels/${channel}/results${resultsQs(cur - 1)}" hx-target="#results" hx-push-url="/channels/${channel}${canonicalQs(cur - 1, activeSubdir)}">&lsaquo; Prev</a>` : ""}
+      <span class="cur">${cur} / ${pages}</span>
+      ${cur < pages ? `<a href="/channels/${channel}${canonicalQs(cur + 1, activeSubdir)}" hx-get="/channels/${channel}/results${resultsQs(cur + 1)}" hx-target="#results" hx-push-url="/channels/${channel}${canonicalQs(cur + 1, activeSubdir)}">Next &rsaquo;</a>` : ""}
+    </div>` : "";
+
+  return `${subdirBar}<div class="count">${total} package${total === 1 ? "" : "s"}${activeSubdir ? ` in <strong>${esc(activeSubdir)}</strong>` : ""}</div>${rows}${pager}`;
 }
 
 // Resolve the logged-in GitHub login from either a Bearer token (CLI) or
@@ -931,6 +976,80 @@ async function browseAuth(request: Request, channel: string, env: Env): Promise<
   return checkReadAccess(channel, login, env);
 }
 
+// GET /search?q= — cross-channel package search across all public channels.
+async function handleGlobalSearch(request: Request, url: URL, env: Env): Promise<Response> {
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
+  const q = url.searchParams.get("q")?.trim() ?? "";
+
+  let rows: Array<{ channel: string; name: string; version: string; summary: string; subdirs: string }> = [];
+  if (q) {
+    // Fetch visible channels first so we can filter results.
+    const { results: channels } = await env.DB.prepare(
+      `SELECT name, owner, visibility FROM channels`
+    ).all<{ name: string; owner: string | null; visibility: string }>();
+    const visible = new Set(
+      channels.filter(c => c.visibility === "public" || c.owner === login).map(c => c.name)
+    );
+
+    const { results } = await env.DB.prepare(
+      `SELECT p.channel, p.name, p.version, p.summary, p.subdirs
+       FROM packages_fts f
+       JOIN packages p ON p.rowid = f.rowid
+       WHERE packages_fts MATCH ?
+       ORDER BY p.name ASC
+       LIMIT 200`
+    ).bind(`"${q.replace(/"/g, '""')}"*`).all<{
+      channel: string; name: string; version: string; summary: string; subdirs: string;
+    }>();
+    rows = results.filter(r => visible.has(r.channel));
+  }
+
+  const resultCards = rows.map(r => {
+    const subdirs: string[] = JSON.parse(r.subdirs ?? "[]");
+    const ns = channelNamespace(r.channel);
+    const chanDisplay = ns
+      ? `<span style="color:#9aacb8">${esc(ns)}/</span>${esc(r.channel.slice(ns.length + 1))}`
+      : esc(r.channel);
+    return `
+      <div class="pkg">
+        <a class="name" href="/channels/${esc(r.channel)}/package/${encodeURIComponent(r.name)}">${esc(r.name)}</a>
+        <span class="ver">${esc(r.version)}</span>
+        <span class="ver" style="margin-left:6px">in <a href="/channels/${esc(r.channel)}" style="color:#52606d">${chanDisplay}</a></span>
+        ${r.summary ? `<div class="summary">${esc(r.summary)}</div>` : ""}
+        <div class="meta">${subdirs.map(s => `<span class="badge">${esc(s)}</span>`).join(" ")}</div>
+      </div>`;
+  }).join("");
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${q ? `${esc(q)} &middot; ` : ""}Search &middot; conda-channel-server</title>
+<style>${BROWSE_CSS}</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="/channels">conda-channel-server</a>
+  <span class="chan-sep">/</span><span class="chan">search</span>
+  ${userWidget(login)}
+</header>
+<main>
+<div class="wrap">
+  <form method="GET" action="/search" class="controls" style="margin-bottom:20px">
+    <label class="sr-only" for="global-search">Search all packages</label>
+    <input id="global-search" type="search" name="q" placeholder="Search all packages&hellip;" value="${esc(q)}" autocomplete="off" autofocus style="flex:1 1 400px">
+    <button type="submit" style="padding:10px 20px;background:#2d7a1f;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Search</button>
+  </form>
+  ${q ? `<div class="count">${rows.length} result${rows.length === 1 ? "" : "s"} for &ldquo;${esc(q)}&rdquo;</div>
+  ${resultCards || `<div class="empty">No packages match &ldquo;${esc(q)}&rdquo; across any public channel.</div>`}` : `<div class="empty" style="padding-top:60px">Enter a package name to search across all public channels.</div>`}
+</div>
+</main>
+</body>
+</html>`;
+  return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
+}
+
 // GET /channels — parent page listing all channels from D1.
 async function handleChannelsIndex(request: Request, env: Env): Promise<Response> {
   const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
@@ -941,19 +1060,38 @@ async function handleChannelsIndex(request: Request, env: Env): Promise<Response
   // Hide private channels the viewer doesn't own.
   const visible = results.filter(ch => ch.visibility === "public" || ch.owner === login);
 
+  // Aggregate subdir counts across all packages for each visible channel.
+  const subdirsByChannel = new Map<string, Set<string>>();
+  if (visible.length > 0) {
+    const placeholders = visible.map(() => "?").join(",");
+    const { results: pkgRows } = await env.DB.prepare(
+      `SELECT channel, subdirs FROM packages WHERE channel IN (${placeholders})`
+    ).bind(...visible.map(c => c.name)).all<{ channel: string; subdirs: string }>();
+    for (const r of pkgRows) {
+      if (!subdirsByChannel.has(r.channel)) subdirsByChannel.set(r.channel, new Set());
+      for (const s of JSON.parse(r.subdirs ?? "[]") as string[]) {
+        subdirsByChannel.get(r.channel)!.add(s);
+      }
+    }
+  }
+
   const cards = visible.map((ch) => {
     const isPrivate = ch.visibility === "private";
-    const lock = isPrivate
-      ? ' <span class="lock-badge">🔒 private</span>'
-      : "";
+    const lock = isPrivate ? ' <span class="lock-badge">🔒 private</span>' : "";
     const ns = channelNamespace(ch.name);
     const displayName = ns
       ? `<span style="color:#9aacb8">${esc(ns)}/</span>${esc(ch.name.slice(ns.length + 1))}`
       : esc(ch.name);
+    const subdirs = [...(subdirsByChannel.get(ch.name) ?? [])].sort();
+    const subdirBadges = subdirs.map(s => `<span class="badge">${esc(s)}</span>`).join(" ");
     return `
       <div class="pkg">
         <a class="name" href="/channels/${ch.name}">${displayName}</a>${lock}
-        <div class="meta">${ch.owner ? `<span>owner: ${esc(ch.owner)}</span>` : ""}<span>conda channel</span></div>
+        <div class="meta">
+          ${ch.owner ? `<span>owner: ${esc(ch.owner)}</span>` : ""}
+          <span>conda channel</span>
+          ${subdirBadges}
+        </div>
       </div>`;
   });
 
@@ -974,6 +1112,11 @@ async function handleChannelsIndex(request: Request, env: Env): Promise<Response
 </header>
 <main>
 <div class="wrap">
+  <form method="GET" action="/search" class="controls">
+    <label class="sr-only" for="global-search">Search all packages</label>
+    <input id="global-search" type="search" name="q" placeholder="Search packages across all channels&hellip;" autocomplete="off">
+    <button type="submit" style="padding:10px 20px;background:#2d7a1f;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Search</button>
+  </form>
   <div class="count">${visible.length} channel${visible.length === 1 ? "" : "s"}</div>
   ${cards.join("") || `<div class="empty">No channels yet.</div>`}
 </div>
@@ -1344,18 +1487,19 @@ async function handleBrowseResults(request: Request, channel: string, url: URL, 
   const q = url.searchParams.get("q") ?? "";
   const sort = url.searchParams.get("sort") ?? "name-asc";
   const page = parseInt(url.searchParams.get("page") ?? "1", 10) || 1;
-  const records = await loadBrowseIndex(channel, env, q, sort);
+  const subdir = url.searchParams.get("subdir") ?? undefined;
+  const records = await loadBrowseIndex(channel, env, q, sort, subdir);
+  const allSubdirs = await loadChannelSubdirs(channel, env);
 
-  // Build the canonical page URL so htmx pushes /channels/:channel?... into the
-  // browser history rather than the /results partial URL.
   const canonicalParams = new URLSearchParams();
   if (q) canonicalParams.set("q", q);
   if (sort !== "name-asc") canonicalParams.set("sort", sort);
+  if (subdir) canonicalParams.set("subdir", subdir);
   if (page > 1) canonicalParams.set("page", String(page));
   const canonicalSearch = canonicalParams.toString();
   const pushUrl = `/channels/${channel}${canonicalSearch ? "?" + canonicalSearch : ""}`;
 
-  return new Response(renderResults(channel, records, q, sort, page), {
+  return new Response(renderResults(channel, records, q, sort, page, subdir, allSubdirs), {
     headers: {
       "content-type": "text/html;charset=utf-8",
       "HX-Push-Url": pushUrl,
@@ -1370,12 +1514,14 @@ async function handleBrowsePage(request: Request, channel: string, url: URL, env
   const q = url.searchParams.get("q") ?? "";
   const sort = url.searchParams.get("sort") ?? "name-asc";
   const page = parseInt(url.searchParams.get("page") ?? "1", 10) || 1;
-  const records = await loadBrowseIndex(channel, env, q, sort);
-  const results = renderResults(channel, records, q, sort, page);
+  const subdir = url.searchParams.get("subdir") ?? undefined;
 
-  const chanRow = await env.DB.prepare(
-    `SELECT owner FROM channels WHERE name = ?`
-  ).bind(channel).first<{ owner: string | null }>();
+  const [records, allSubdirs, chanRow] = await Promise.all([
+    loadBrowseIndex(channel, env, q, sort, subdir),
+    loadChannelSubdirs(channel, env),
+    env.DB.prepare(`SELECT owner FROM channels WHERE name = ?`).bind(channel).first<{ owner: string | null }>(),
+  ]);
+  const results = renderResults(channel, records, q, sort, page, subdir, allSubdirs);
   const isOwner = !!login && login === chanRow?.owner;
 
   const ns = channelNamespace(channel);
@@ -1494,14 +1640,17 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
   const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
   name = decodeURIComponent(name);
 
-  // D1 lookup for summary, license, home, latest version, subdirs.
-  const row = await env.DB.prepare(
-    `SELECT name, version, summary, license, home, subdirs FROM packages WHERE channel = ? AND name = ?`
-  ).bind(channel, name).first<{
-    name: string; version: string; summary: string;
-    license: string; home: string; subdirs: string;
-  }>();
+  const [row, chanRow] = await Promise.all([
+    env.DB.prepare(
+      `SELECT name, version, summary, license, home, subdirs FROM packages WHERE channel = ? AND name = ?`
+    ).bind(channel, name).first<{
+      name: string; version: string; summary: string;
+      license: string; home: string; subdirs: string;
+    }>(),
+    env.DB.prepare(`SELECT owner FROM channels WHERE name = ?`).bind(channel).first<{ owner: string | null }>(),
+  ]);
   if (!row) return new Response("package not found", { status: 404 });
+  const isOwner = !!login && login === chanRow?.owner;
   const rec: BrowseRecord = { ...row, subdirs: JSON.parse(row.subdirs ?? "[]") as string[] };
 
   // Load all builds from repodata.json (has full metadata: deps, size, sha256, etc.)
@@ -1540,6 +1689,7 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
       <td class="num">${b.size != null ? fmtBytes(b.size) : ""}</td>
       <td class="num mono" title="${b.sha256 ? `SHA256: ${b.sha256}` : ""}">${b.md5 ? b.md5.slice(0, 8) + "…" : ""}</td>
       <td class="num">${fmtDate(b.timestamp)}</td>
+      ${isOwner ? `<td><button class="del-file-btn" data-channel="${esc(channel)}" data-subdir="${esc(b.subdir)}" data-filename="${esc(b.filename)}">Delete</button></td>` : ""}
     </tr>`;
 
   // Render version group (collapsible <details>).
@@ -1551,7 +1701,7 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
       <span class="ver-subdirs">${[...new Set(vbuilds.map((b) => b.subdir))].map((s) => `<span class="badge">${esc(s)}</span>`).join(" ")}</span>
     </summary>
     <table class="files-table">
-      <thead><tr><th>Filename</th><th>Subdir</th><th>Build</th><th>Size</th><th>MD5</th><th>Date</th></tr></thead>
+      <thead><tr><th>Filename</th><th>Subdir</th><th>Build</th><th>Size</th><th>MD5</th><th>Date</th>${isOwner ? "<th></th>" : ""}</tr></thead>
       <tbody>${vbuilds.map(fileRow).join("")}</tbody>
     </table>
   </details>`).join("");
@@ -1571,7 +1721,10 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="${esc(rec.summary || `${name} package in the ${channel} conda channel`)}">
 <title>${esc(name)} &middot; ${esc(channel)}</title>
-<style>${BROWSE_CSS}${PKG_DETAIL_CSS}</style>
+<style>${BROWSE_CSS}${PKG_DETAIL_CSS}
+  .del-file-btn { background:#fff; color:#b42318; border:1px solid #f5c2bf; padding:3px 10px; border-radius:5px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  .del-file-btn:hover { background:#fdecea; }
+</style>
 </head>
 <body>
 <header>
@@ -1617,6 +1770,26 @@ async function handleBrowsePackage(request: Request, channel: string, name: stri
 
 </div>
 </main>
+${isOwner ? `<script>
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('.del-file-btn');
+  if (!btn) return;
+  const { channel, subdir, filename } = btn.dataset;
+  if (!confirm('Delete ' + filename + ' from ' + subdir + '?\\nThis will reindex the channel.')) return;
+  btn.disabled = true; btn.textContent = 'Deleting…';
+  const resp = await fetch('/channel/' + channel + '/' + subdir + '/' + filename, {
+    method: 'DELETE', credentials: 'same-origin'
+  });
+  if (resp.ok) {
+    const row = btn.closest('tr');
+    row.style.opacity = '0.4';
+    setTimeout(() => { row.remove(); }, 400);
+  } else {
+    alert('Delete failed: ' + await resp.text());
+    btn.disabled = false; btn.textContent = 'Delete';
+  }
+});
+</script>` : ""}
 </body>
 </html>`;
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
@@ -1669,15 +1842,14 @@ async function handleChannelRoot(request: Request, channel: string, env: Env): P
 // Auth: upload token (same token as upload — "can manage this channel")
 // ---------------------------------------------------------------------------
 async function handleDeletePackage(request: Request, channel: string, subdir: string, filename: string, env: Env): Promise<Response> {
-  const auth = request.headers.get("authorization") ?? "";
-  const token = auth.replace(/^Bearer\s+/i, "");
-  const claims = await verifyUploadToken(token, env.UPLOAD_TOKEN_SECRET);
-  if (!claims) return new Response("unauthorized", { status: 401 });
+  // Accept both Bearer token (CLI) and session cookie (browser UI).
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
+  if (!login) return new Response("unauthorized", { status: 401 });
 
   const invalid = validateChannelAndFilename(channel, filename);
   if (invalid) return new Response(invalid, { status: 400 });
 
-  const denied = await checkChannelAccess(channel, claims.login, env);
+  const denied = await checkChannelAccess(channel, login, env);
   if (denied) return denied;
 
   const key = `${channel}/${subdir}/${filename}`;
