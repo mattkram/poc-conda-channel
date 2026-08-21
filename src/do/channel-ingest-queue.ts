@@ -5,6 +5,9 @@ import type { Env, PendingUpload } from "../types.js";
 const INGEST_QUEUE_DRAIN_MS = 100;
 // Back-off when the container platform has no capacity.
 const CONTAINER_UNAVAILABLE_RETRY_MS = 15_000;
+const CONTAINER_ERROR_RETRY_MS = 60_000;
+// Maximum retries before giving up on a single package and logging it as dead.
+const MAX_RETRIES = 10;
 
 export class ChannelIngestQueue extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
@@ -12,27 +15,48 @@ export class ChannelIngestQueue extends DurableObject<Env> {
     if (url.pathname === "/enqueue" && request.method === "POST") {
       const upload = await request.json<PendingUpload>();
       const key = `work:${String(upload.uploadedAt).padStart(15, "0")}:${upload.filename}`;
-      await this.ctx.storage.put(key, upload);
-      const existing = await this.ctx.storage.getAlarm();
-      if (existing === null) {
+      // Only enqueue if not already present (idempotent).
+      const existing = await this.ctx.storage.get(key);
+      if (!existing) {
+        await this.ctx.storage.put(key, { ...upload, retries: 0 });
+      }
+      if ((await this.ctx.storage.getAlarm()) === null) {
         await this.ctx.storage.setAlarm(Date.now() + INGEST_QUEUE_DRAIN_MS);
       }
       return new Response("queued", { status: 202 });
     }
     if (url.pathname === "/purge" && request.method === "POST") {
       const all = await this.ctx.storage.list({ prefix: "work:" });
-      await this.ctx.storage.delete([...all.keys()]);
+      const dead = await this.ctx.storage.list({ prefix: "dead:" });
+      await this.ctx.storage.delete([...all.keys(), ...dead.keys()]);
       await this.ctx.storage.deleteAlarm();
-      return Response.json({ purged: all.size });
+      return Response.json({ purged: all.size + dead.size });
+    }
+    if (url.pathname === "/status" && request.method === "GET") {
+      const work = await this.ctx.storage.list({ prefix: "work:" });
+      const dead = await this.ctx.storage.list({ prefix: "dead:" });
+      return Response.json({ pending: work.size, dead: dead.size });
     }
     return new Response("not found", { status: 404 });
   }
 
   async alarm(): Promise<void> {
-    const list = await this.ctx.storage.list<PendingUpload>({ prefix: "work:", limit: 1 });
+    const list = await this.ctx.storage.list<PendingUpload & { retries: number }>(
+      { prefix: "work:", limit: 1 }
+    );
     if (list.size === 0) return;
     const [[key, upload]] = list.entries();
     const { channel, filename } = upload;
+    const retries = upload.retries ?? 0;
+
+    // Dead-letter: too many retries, move to dead queue and log.
+    if (retries >= MAX_RETRIES) {
+      console.error(`[ChannelIngestQueue] dead-lettering ${channel}/${filename} after ${retries} retries`);
+      await this.ctx.storage.put(`dead:${key.slice("work:".length)}`, upload);
+      await this.ctx.storage.delete(key);
+      await this._scheduleNext();
+      return;
+    }
 
     let resp: Response;
     try {
@@ -44,18 +68,20 @@ export class ChannelIngestQueue extends DurableObject<Env> {
         headers: { "content-type": "application/json" },
       });
     } catch (err: unknown) {
-      // Container platform unavailable — back off and retry the whole queue.
+      // Container platform unavailable — back off, keeping item at front of queue.
       const msg = err instanceof Error ? err.message : String(err);
       const isCapacity = msg.includes("no container instance") || msg.includes("try again later");
-      const retryMs = isCapacity ? CONTAINER_UNAVAILABLE_RETRY_MS : 60_000;
+      const retryMs = isCapacity ? CONTAINER_UNAVAILABLE_RETRY_MS : CONTAINER_ERROR_RETRY_MS;
+      await this.ctx.storage.put(key, { ...upload, retries: retries + 1 });
       await this.ctx.storage.setAlarm(Date.now() + retryMs);
       return;
     }
 
     if (!resp.ok) {
-      // Container returned an error — requeue with a delay.
-      const retryKey = `work:${String(Date.now() + 60_000).padStart(15, "0")}:${filename}`;
-      await this.ctx.storage.put(retryKey, upload);
+      // Container returned an error — increment retry count, move to back of queue.
+      const newTs = String(Date.now() + CONTAINER_ERROR_RETRY_MS).padStart(15, "0");
+      const retryKey = `work:${newTs}:${filename}`;
+      await this.ctx.storage.put(retryKey, { ...upload, retries: retries + 1 });
       await this.ctx.storage.delete(key);
     } else {
       const result = await resp.json<{
@@ -82,6 +108,10 @@ export class ChannelIngestQueue extends DurableObject<Env> {
       }
     }
 
+    await this._scheduleNext();
+  }
+
+  private async _scheduleNext(): Promise<void> {
     const remaining = await this.ctx.storage.list({ prefix: "work:", limit: 1 });
     if (remaining.size > 0) {
       await this.ctx.storage.setAlarm(Date.now() + INGEST_QUEUE_DRAIN_MS);

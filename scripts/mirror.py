@@ -169,6 +169,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None, help="Random seed (ignored with --all-versions)")
     parser.add_argument("--stats", metavar="FILE", default=None,
                         help="Write per-package upload stats to a JSON file")
+    parser.add_argument("--packages", nargs="*", metavar="NAME",
+                        help="Only mirror these package names (e.g. numpy scipy). "
+                             "These are always included before random --count fills.")
     args = parser.parse_args()
 
     dl_workers = args.dl_workers or args.workers
@@ -184,15 +187,35 @@ def main() -> None:
 
     # Collect packages across all subdirs, deduping against destination.
     all_selected: list[tuple[dict, str]] = []  # (meta, subdir)
+    pinned_names: set[str] = set(args.packages or [])
     for subdir in args.subdirs:
         src_url = f"{source_base}/{subdir}/repodata.json"
         dst_url = f"{args.worker_url.rstrip('/')}/repo/{args.channel}/{subdir}/repodata.json"
         src = fetch_repodata(src_url, f"source {subdir}")
         dst = fetch_repodata(dst_url, f"dest {subdir}")
         already = len(all_filenames(dst))
-        count = 0 if args.all_versions else args.count
-        sel = pick_packages(src, dst, count, args.seed, args.all_versions)
-        print(f"  {subdir}: {len(sel)} new packages to upload (dest has {already})")
+        already_have = all_filenames(dst)
+
+        # Always include pinned package names first (latest version, not already present).
+        pinned: list[dict] = []
+        if pinned_names:
+            candidates = candidate_packages(src, all_versions=False)
+            for meta in candidates:
+                if meta.get("name") in pinned_names and meta["filename"] not in already_have:
+                    pinned.append(meta)
+
+        # Fill remaining slots with random selection (excluding pinned).
+        pinned_filenames = {m["filename"] for m in pinned}
+        remaining_count = max(0, (0 if args.all_versions else args.count) - len(pinned))
+        src_without_pinned = {
+            fmt: {k: v for k, v in src.get(fmt, {}).items() if k not in pinned_filenames}
+            for fmt in ("packages", "packages.conda")
+        }
+        rest = pick_packages(src_without_pinned, dst, remaining_count, args.seed, args.all_versions)
+
+        sel = pinned + rest
+        print(f"  {subdir}: {len(sel)} new packages to upload (dest has {already})"
+              + (f" [{len(pinned)} pinned]" if pinned else ""))
         all_selected.extend((m, subdir) for m in sel)
 
     if not all_selected:

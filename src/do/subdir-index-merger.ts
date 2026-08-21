@@ -30,15 +30,23 @@ export class SubdirIndexMerger extends DurableObject<Env> {
 
     await this.ctx.storage.put("dirty", false);
 
-    const container = getContainer(this.env.INDEXER, `${channel}/${subdir}/_merge`);
-    const resp = await container.fetch("http://container/rebuild-index", {
-      method: "POST",
-      body: JSON.stringify({ channel, subdir }),
-      headers: { "content-type": "application/json" },
-    });
-    if (!resp.ok) {
+    try {
+      const container = getContainer(this.env.INDEXER, `${channel}/${subdir}/_merge`);
+      const resp = await container.fetch("http://container/rebuild-index", {
+        method: "POST",
+        body: JSON.stringify({ channel, subdir }),
+        headers: { "content-type": "application/json" },
+      });
+      if (!resp.ok) {
+        await this.ctx.storage.put("dirty", true);
+        await this.ctx.storage.setAlarm(Date.now() + 60_000);
+        return;
+      }
+    } catch (err) {
       await this.ctx.storage.put("dirty", true);
-      throw new Error(`rebuild-index failed for ${channel}/${subdir}: ${await resp.text()}`);
+      const isCapacity = String(err).includes("no container instance");
+      await this.ctx.storage.setAlarm(Date.now() + (isCapacity ? 15_000 : 60_000));
+      return;
     }
 
     const stillDirty = await this.ctx.storage.get<boolean>("dirty");

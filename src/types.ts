@@ -7,6 +7,7 @@ import type { Container } from "@cloudflare/containers";
 export interface Env {
   CHANNEL_BUCKET: R2Bucket;
   DB: D1Database;
+  ASSETS: Fetcher;
   // INDEXER is a Container DO — typed precisely so getContainer() calls type-check.
   INDEXER: DurableObjectNamespace<Container<Env>>;
   QUEUE: DurableObjectNamespace;

@@ -72,8 +72,8 @@ def record(conn: sqlite3.Connection, channel: str, filename: str,
 # Upload helpers
 # ---------------------------------------------------------------------------
 
-def api(server: str, path: str, body: dict, token: str) -> dict:
-    """POST JSON to the conda-wit API."""
+def post(server: str, path: str, body: dict, token: str) -> bytes:
+    """POST JSON to the conda-wit API, return raw response bytes."""
     data = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{server}{path}",
@@ -86,7 +86,12 @@ def api(server: str, path: str, body: dict, token: str) -> dict:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+        return resp.read()
+
+
+def api(server: str, path: str, body: dict, token: str) -> dict:
+    """POST JSON and parse JSON response."""
+    return json.loads(post(server, path, body, token))
 
 
 def upload_package(server: str, token: str, channel: str,
@@ -113,8 +118,8 @@ def upload_package(server: str, token: str, channel: str,
     with urllib.request.urlopen(put_req, timeout=120):
         pass
 
-    # Step 3 — notify complete
-    api(server, "/upload/complete", {"channel": channel, "filename": filename}, token)
+    # Step 3 — notify complete (returns 202 plain text, not JSON)
+    post(server, "/upload/complete", {"channel": channel, "filename": filename}, token)
     return "ok"
 
 

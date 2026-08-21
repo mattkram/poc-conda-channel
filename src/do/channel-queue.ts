@@ -80,12 +80,19 @@ export class ChannelQueue extends DurableObject<Env> {
       entries.map(async ([key, upload]) => {
         const id = this.env.INGESTOR.idFromName(`${upload.channel}/${upload.filename}`);
         const ingestor = this.env.INGESTOR.get(id);
-        await ingestor.fetch("http://ingestor/ingest", {
-          method: "POST",
-          body: JSON.stringify(upload),
-          headers: { "content-type": "application/json" },
-        });
-        await this.ctx.storage.delete(key);
+        try {
+          const resp = await ingestor.fetch("http://ingestor/ingest", {
+            method: "POST",
+            body: JSON.stringify(upload),
+            headers: { "content-type": "application/json" },
+          });
+          if (resp.ok) {
+            await this.ctx.storage.delete(key);
+          }
+          // else: leave in pending, retry on next alarm
+        } catch {
+          // Network/DO error — leave in pending for retry
+        }
       }),
     );
 
