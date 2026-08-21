@@ -4,13 +4,16 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   deploy:
     name: Deploy to Cloudflare Workers
     runs-on: ubuntu-latest
+    environment: production
     permissions:
       contents: read
+      deployments: write
 
     steps:
       - uses: actions/checkout@v4
