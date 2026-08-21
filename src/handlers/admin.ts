@@ -34,8 +34,8 @@ const ADMIN_CSS = `
   .form-row { display:flex; align-items:center; gap:8px; font-size:13px; margin-top:4px; }
   .form-row label { font-weight:600; color:#52606d; }
   .btn { padding:8px 18px; border:none; border-radius:6px; font-size:13px; font-weight:600; cursor:pointer; }
-  .btn-primary { background:#2d7a1f; color:#fff; margin-top:14px; }
-  .btn-primary:hover { background:#246018; }
+  .btn-primary { background:#0B8275; color:#fff; margin-top:14px; }
+  .btn-primary:hover { background:#0f9a8a; }
   .btn-danger { background:#fff; color:#b42318; border:1px solid #f5c2bf; padding:5px 12px; border-radius:6px; font-size:12px; cursor:pointer; white-space:nowrap; }
   .btn-danger:hover { background:#fdecea; }
   .vis-form { display:flex; align-items:center; gap:10px; }
@@ -66,9 +66,9 @@ export async function handleAdminPage(
     .bind(channel)
     .all<Omit<TrustedPublisherRow, "channel">>();
 
-  const chanInfo = await env.DB.prepare(`SELECT visibility FROM channels WHERE name = ?`)
+  const chanInfo = await env.DB.prepare(`SELECT visibility, require_oidc FROM channels WHERE name = ?`)
     .bind(channel)
-    .first<{ visibility: string }>();
+    .first<{ visibility: string; require_oidc: number }>();
 
   const ns = channelNamespace(channel);
   const channelHeader = ns
@@ -87,7 +87,6 @@ export async function handleAdminPage(
       <td class="col-workflow">${code(r.workflow)}</td>
       <td class="col-env">${code(r.environment)}</td>
       <td class="col-pkg">${code(r.package_name)}</td>
-      <td class="col-bool">${r.require_trusted ? '<span class="yes-badge">Yes</span>' : '<span class="no-badge">No</span>'}</td>
       <td class="col-by">${esc(r.created_by)}</td>
       <td class="col-action">
         <form method="POST" action="/channel/${esc(channel)}/trusted-publishers/${r.id}" style="display:inline">
@@ -100,6 +99,7 @@ export async function handleAdminPage(
     .join("");
 
   const visibility = chanInfo?.visibility ?? "public";
+  const requireOidc = chanInfo?.require_oidc ?? 0;
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -130,7 +130,7 @@ ${GOOGLE_FONTS}
     <table class="tp-table">
       <thead>
         <tr>
-          <th>ID</th><th>Repository</th><th>Workflow ref prefix</th><th>Environment</th><th>Package</th><th>OIDC only?</th><th>Added by</th><th></th>
+          <th>ID</th><th>Repository</th><th>Workflow ref prefix</th><th>Environment</th><th>Package</th><th>Added by</th><th></th>
         </tr>
       </thead>
       <tbody>${rulesRows}</tbody>
@@ -138,7 +138,7 @@ ${GOOGLE_FONTS}
     </div>` : `<p class="empty-rules">No trusted publisher rules yet.</p>`}
 
     <details style="margin-top:16px">
-      <summary style="cursor:pointer;font-weight:600;font-size:13px;color:#2d7a1f">+ Add rule</summary>
+      <summary style="cursor:pointer;font-weight:600;font-size:13px;color:#0B8275">+ Add rule</summary>
       <form method="POST" action="/channel/${esc(channel)}/trusted-publishers" style="margin-top:12px">
         <div class="form-grid">
           <label>Repository <span class="hint">(e.g. owner/repo, blank = any)</span>
@@ -154,29 +154,36 @@ ${GOOGLE_FONTS}
             <input type="text" name="package_name" placeholder="my-package">
           </label>
         </div>
-        <div class="form-row" style="margin-top:10px">
-          <input type="checkbox" id="require_trusted" name="require_trusted" value="1">
-          <label for="require_trusted">Require OIDC — reject normal upload tokens for this channel</label>
-        </div>
         <button type="submit" class="btn btn-primary">Add rule</button>
       </form>
     </details>
   </div>
 
   <div class="admin-section">
-    <h2>Channel Visibility</h2>
-    <p style="font-size:13px;color:#3d4f5c;margin:0 0 12px">
-      Current: <strong>${esc(visibility)}</strong>
+    <h2>Channel Settings</h2>
+    <p style="font-size:13px;color:#3d4f5c;margin:0 0 14px">
+      <strong>Visibility:</strong> ${esc(visibility)}
     </p>
-    <form method="POST" action="/channel/${esc(channel)}/visibility" class="vis-form">
+    <form method="POST" action="/channel/${esc(channel)}/visibility" class="vis-form" style="margin-bottom:16px">
       <select name="visibility">
         <option value="public"${visibility === "public" ? " selected" : ""}>Public</option>
         <option value="private"${visibility === "private" ? " selected" : ""}>Private</option>
       </select>
       <button type="submit" class="btn btn-primary" style="margin-top:0">Save</button>
     </form>
-    <p style="font-size:12px;color:#9aacb8;margin:8px 0 0">
+    <p style="font-size:12px;color:#9aacb8;margin:0 0 16px">
       Private channels are only visible to you. Visibility changes take effect immediately.
+    </p>
+    <hr style="border:none;border-top:1px solid #e4e7eb;margin:0 0 16px">
+    <form method="POST" action="/channel/${esc(channel)}/require-oidc" class="vis-form">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#52606d;cursor:pointer">
+        <input type="checkbox" name="require_oidc" value="1"${requireOidc ? " checked" : ""}>
+        Require OIDC — reject normal upload tokens for this channel
+      </label>
+      <button type="submit" class="btn btn-primary" style="margin-top:0">Save</button>
+    </form>
+    <p style="font-size:12px;color:#9aacb8;margin:8px 0 0">
+      When enabled, only GitHub Actions OIDC tokens (trusted publisher rules) are accepted. Normal upload tokens are rejected.
     </p>
   </div>
 

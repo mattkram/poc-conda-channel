@@ -50,12 +50,11 @@ export function checkTokenScope(
 
 export async function isTrustedPublishingRequired(channel: string, env: Env): Promise<boolean> {
   const row = await env.DB.prepare(
-    `SELECT COUNT(*) as total, SUM(require_trusted) as req FROM trusted_publishers WHERE channel = ?`,
+    `SELECT require_oidc FROM channels WHERE name = ?`,
   )
     .bind(channel)
-    .first<{ total: number; req: number | null }>();
-  if (!row || row.total === 0) return false;
-  return (row.req ?? 0) >= row.total;
+    .first<{ require_oidc: number }>();
+  return (row?.require_oidc ?? 0) === 1;
 }
 
 // ---------------------------------------------------------------------------
