@@ -90,7 +90,7 @@ export async function pollDeviceFlow(request: Request, env: Env): Promise<Respon
   }
 
   const ghUser = await fetch("https://api.github.com/user", {
-    headers: { authorization: `Bearer ${data.access_token}`, "user-agent": "conda-channel-server" },
+    headers: { authorization: `Bearer ${data.access_token}`, "user-agent": "conda-wit" },
   }).then((r) => r.json<{ login: string }>());
 
   const uploadToken = await signUploadToken({ login: ghUser.login }, env.UPLOAD_TOKEN_SECRET);
@@ -180,7 +180,7 @@ export async function handleBrowserLoginCallback(
   const ghUser = await fetch("https://api.github.com/user", {
     headers: {
       authorization: `Bearer ${tokenData.access_token}`,
-      "user-agent": "conda-channel-server",
+      "user-agent": "conda-wit",
     },
   }).then((r) => r.json<{ login: string }>());
 

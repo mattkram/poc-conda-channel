@@ -1,4 +1,4 @@
-# conda-channel-server
+# conda-wit
 
 Lightweight conda package channel server. R2 for storage, one Cloudflare
 Worker for auth + upload, one Cloudflare Container running real

@@ -43,8 +43,8 @@ export async function handleOidcExchange(request: Request, env: Env): Promise<Re
     return new Response(`invalid iss: expected ${OIDC_ISSUER}`, { status: 401 });
 
   const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud ?? ""];
-  if (!aud.includes("conda-channel-server"))
-    return new Response(`invalid aud: expected 'conda-channel-server'`, { status: 401 });
+  if (!aud.includes("conda-wit"))
+    return new Response(`invalid aud: expected 'conda-wit'`, { status: 401 });
   if (!claims.exp || claims.exp < Math.floor(Date.now() / 1000))
     return new Response("JWT has expired", { status: 401 });
   if (header.alg !== "RS256")

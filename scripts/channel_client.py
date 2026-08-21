@@ -1,5 +1,5 @@
 """
-Reusable client library for conda-channel-server.
+Reusable client library for conda-wit.
 
 Provides:
   ChannelClient   — all API calls (auth, upload, delete, repodata poll)
@@ -108,7 +108,7 @@ def _get_json(url: str) -> tuple[int, dict | str]:
 
 class ChannelClient:
     """
-    High-level client for conda-channel-server.
+    High-level client for conda-wit.
 
     All methods raise ChannelError on failure unless noted otherwise.
     """

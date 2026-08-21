@@ -1,7 +1,7 @@
 [workspace]
-name = "conda-channel-server-container"
+name = "conda-wit-container"
 version = "0.1.0"
-description = "Metadata extractor and indexer for conda-channel-server"
+description = "Metadata extractor and indexer for conda-wit"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
 

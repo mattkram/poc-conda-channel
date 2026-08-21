@@ -1,9 +1,13 @@
-# conda-channel-server
+# conda-wit
+
+> **Proof of concept — no stability guarantees.**
+> This project is under active development and is not yet production-ready.
+> APIs, storage layouts, and configuration may change without notice.
+> Use at your own risk.
 
 Lightweight conda channel server: R2 for storage, one Cloudflare Worker for auth, upload
 orchestration, and a browse UI; one Cloudflare Container running the indexer that wakes on
 upload and sleeps 2 min after going idle.
-
 Accepts both `.conda` (current format) and legacy `.tar.bz2` packages.
 `conda_package_streaming` extracts metadata from either uniformly.
 `conda-index` is present in the container image but is **only invoked on the deletion slow
@@ -68,7 +72,7 @@ container/
 ### 1. Create the R2 bucket
 
 ```bash
-wrangler r2 bucket create conda-channel
+wrangler r2 bucket create conda-wit
 ```
 
 Edit `R2_BUCKET_NAME` in `wrangler.toml` `[vars]` first if you want a different name.
