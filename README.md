@@ -21,21 +21,16 @@ flowchart TD
     R2[(R2)]
     D1[(D1)]
 
-    Client -- "auth flow" --> Worker
-    Worker -- "verify membership / JWKS" --> Auth
-    Worker -- "upload token" --> Client
-
-    Client -- "upload init/complete" --> Worker
+    Client -- "auth · upload · browse" --> Worker
     Client -- "PUT package bytes" --> R2
-    Worker -- "presign · confirm" --> R2
+    Worker <--> Auth
+    Worker -- "presign · confirm · proxy" --> R2
+    Worker --- D1
     Worker -- "enqueue" --> DOs
 
-    DOs -- "ingest-package\nrebuild-index" --> Container
+    DOs -- "ingest · rebuild" --> Container
     Container -- "read/write packages\nshards · repodata" --> R2
     Container -- "upsert browse record" --> Worker
-    Worker -- "browse queries\nbrowse writes" --> D1
-
-    Client -- "browse UI / repodata" --> Worker
 ```
 
 ## Source layout
