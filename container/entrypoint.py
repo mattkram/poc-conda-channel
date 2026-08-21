@@ -93,6 +93,15 @@ def log(event: str, **kwargs) -> None:
     print(json.dumps(record), flush=True)
 
 
+# Log env var presence at startup so we can confirm secrets are injected.
+log("startup.env",
+    has_r2_account=bool(R2_ACCOUNT_ID),
+    has_r2_key=bool(R2_ACCESS_KEY_ID),
+    has_worker_url=bool(WORKER_URL),
+    has_internal_secret=bool(INTERNAL_SECRET),
+    bucket=BUCKET)
+
+
 def _upsert_d1(channel: str, browse: dict) -> None:
     """POST a single browse record to the Worker's D1 upsert endpoint.
     Used on the per-package hot path. Best-effort — never raises."""
@@ -124,20 +133,36 @@ def _upsert_d1(channel: str, browse: dict) -> None:
 
 
 def _bulk_upsert_d1(channel: str, records: list[dict]) -> None:
-    """POST all browse records for a channel in one call to /internal/reconcile.
-    Used after index rebuilds so D1 stays in sync without N individual calls.
-    Best-effort — never raises."""
+    """POST all browse records for a channel in a single call to
+    /internal/upsert-packages (plural). One HTTP round-trip regardless of
+    channel size. Best-effort — never raises."""
     if not WORKER_URL or not records:
         return
     try:
-        # Reuse the reconcile endpoint by POSTing pre-assembled records directly.
-        # We call upsert-package for each record but batch them in threads so
-        # it's fast even for large channels. Cap at 32 threads to be polite.
-        import concurrent.futures
-        def _one(rec):
-            _upsert_d1(channel, rec)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, len(records))) as ex:
-            list(ex.map(_one, records))
+        packages = [
+            {
+                "channel": channel,
+                "name": rec.get("name", ""),
+                "version": rec.get("version", ""),
+                "summary": rec.get("summary") or None,
+                "license": rec.get("license") or None,
+                "home": rec.get("home") or None,
+                "subdirs": rec.get("subdirs", []),
+            }
+            for rec in records
+        ]
+        body = json.dumps({"packages": packages}).encode()
+        req = urllib.request.Request(
+            f"{WORKER_URL}/internal/upsert-packages",
+            data=body,
+            headers={
+                "content-type": "application/json",
+                "x-internal-secret": INTERNAL_SECRET,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30):
+            pass
         log("d1_bulk_upsert.done", channel=channel, n=len(records))
     except Exception as exc:
         log("d1_bulk_upsert.error", channel=channel, error=str(exc))
@@ -358,7 +383,7 @@ def ingest_package(channel: str, filename: str, staging_key: str) -> dict:
             raise
     browse["subdirs"] = sorted(subdirs_seen)
     s3.put_object(Bucket=BUCKET, Key=browse_key,
-                  Body=json.dumps(browse).encode(), ContentType="application/json")
+                  Body=json.dumps(browse, ensure_ascii=False).encode(), ContentType="application/json")
     # Mirror to D1 for fast website queries (best-effort, R2 is source of truth).
     _upsert_d1(channel, browse)
 
@@ -518,7 +543,7 @@ def rebuild_index_and_repodata(channel: str, subdir: str) -> dict:
         "repodata_version": 2,
     }
     s3.put_object(Bucket=BUCKET, Key=f"{prefix}/repodata.json",
-                  Body=json.dumps(repodata).encode(),
+                  Body=json.dumps(repodata, ensure_ascii=False).encode(),
                   CacheControl="public, max-age=300",
                   ContentType="application/json")
 
@@ -611,7 +636,7 @@ def rebuild_browse_from_repodata(channel: str) -> dict:
         except botocore.exceptions.ClientError:
             pass
         s3.put_object(Bucket=BUCKET, Key=browse_key,
-                      Body=json.dumps(r).encode(), ContentType="application/json")
+                      Body=json.dumps(r, ensure_ascii=False).encode(), ContentType="application/json")
 
     # _rebuild_browse_index aggregates all records and bulk-upserts D1.
     _rebuild_browse_index(channel)
@@ -628,12 +653,14 @@ def _register_channel(channel: str) -> None:
     """
     if WORKER_URL:
         try:
-            body = json.dumps({"channel": channel, "name": channel,
-                               "version": "", "subdirs": []}).encode()
+            body = json.dumps({"channel": channel}).encode()
             req = urllib.request.Request(
-                f"{WORKER_URL}/internal/upsert-package",
+                f"{WORKER_URL}/internal/register-channel",
                 data=body,
-                headers={"content-type": "application/json"},
+                headers={
+                    "content-type": "application/json",
+                    "x-internal-secret": INTERNAL_SECRET,
+                },
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=5):
@@ -690,12 +717,17 @@ class Handler(BaseHTTPRequestHandler):
             if not channel or not subdir:
                 self._respond(400, b"missing channel or subdir")
                 return
-            try:
-                result = rebuild_index_and_repodata(channel, subdir)
-                self._respond(200, json.dumps(result).encode())
-            except Exception as e:  # noqa: BLE001
-                log("rebuild.error", channel=channel, subdir=subdir, error=str(e))
-                self._respond(500, json.dumps({"error": str(e)}).encode())
+            # Run rebuild in a background thread so we can return 202 immediately.
+            # The Worker has a ~30s timeout on container fetches; conda-index takes
+            # longer than that on large subdirs, causing false 500s and retry loops.
+            import threading
+            def _run():
+                try:
+                    rebuild_index_and_repodata(channel, subdir)
+                except Exception as e:  # noqa: BLE001
+                    log("rebuild.error", channel=channel, subdir=subdir, error=str(e))
+            threading.Thread(target=_run, daemon=True).start()
+            self._respond(202, json.dumps({"status": "rebuilding"}).encode())
 
         elif self.path == "/rebuild-browse":
             channel = payload.get("channel")

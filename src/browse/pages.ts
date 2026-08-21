@@ -11,7 +11,7 @@ import {
 } from "../handlers/channel.js";
 import { verifyUploadToken } from "../handlers/auth.js";
 import { validateChannelAndFilename } from "../handlers/upload.js";
-import { BROWSE_CSS, PKG_DETAIL_CSS, HERO_CSS } from "./ui.js";
+import { BROWSE_CSS, PKG_DETAIL_CSS, HERO_CSS, GOOGLE_FONTS, FAVICON_TAGS, FOOTER_HTML } from "./ui.js";
 import {
   loadBrowseIndex,
   loadChannelSubdirs,
@@ -106,76 +106,59 @@ export async function handleHomepage(request: Request, url: URL, env: Env): Prom
   const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
   const q = url.searchParams.get("q")?.trim() ?? "";
 
-  const { results } = await env.DB.prepare(
-    `SELECT name, owner, visibility FROM channels ORDER BY name`,
-  ).all<{ name: string; owner: string | null; visibility: string }>();
-  const visible = results.filter((c) => c.visibility === "public" || c.owner === login);
-
-  const chanCards = visible
-    .map((ch) => {
-      const ns = channelNamespace(ch.name);
-      const displayName = ns
-        ? `<span style="color:#9aacb8">${esc(ns)}/</span>${esc(ch.name.slice(ns.length + 1))}`
-        : esc(ch.name);
-      const lock =
-        ch.visibility === "private" ? ' <span class="lock-badge">🔒 private</span>' : "";
-      return `<div class="pkg">
-      <a class="name" href="/channels/${ch.name}">${displayName}</a>${lock}
-      <div class="meta">${ch.owner ? `<span>owner: ${esc(ch.owner)}</span>` : ""}<span>conda channel</span></div>
-    </div>`;
-    })
-    .join("");
-
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Search and browse conda packages across all channels.">
 <title>conda-wit</title>
 <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}${HERO_CSS}</style>
 </head>
 <body>
 <header>
   <a class="brand" href="/">conda-wit</a>
-  <span class="chan-sep">/</span><a class="chan" href="/channels" style="text-decoration:none">channels</a>
+  <span class="chan-sep">/</span>
+  <a class="chan" href="/channels" style="text-decoration:none">channels</a>
   ${userWidget(login)}
 </header>
 
+<main>
 <div class="hero">
-  <h1>Find conda packages</h1>
-  <p>Search across all public channels hosted on this server.</p>
+  <img class="hero-logo" src="/logo.png" alt="conda-wit — Ethereal Package Channeling" width="340" height="266" fetchpriority="high">
+  <p class="hero-tagline">Ethereal Package Channeling</p>
   <form class="hero-search-wrap"
         hx-get="/search/results"
         hx-trigger="input changed delay:300ms from:input[name='q'], submit"
         hx-target="#search-results"
         action="/search" method="GET">
     <input type="search" name="q" value="${esc(q)}"
-           placeholder="Search packages&hellip;"
+           placeholder="Search packages across all channels&hellip;"
            autocomplete="off" autofocus
            aria-label="Search packages">
     <button type="submit">Search</button>
   </form>
+  <div class="hero-links" id="hero-links"${q ? ' style="display:none"' : ""}>
+    <a href="/channels">Browse channels &rsaquo;</a>
+  </div>
 </div>
 
 <div id="search-results">${q ? `<div style="text-align:center;padding:32px;color:#9aacb8">Loading…</div>
 <script>htmx.ajax('GET','/search/results?q=${encodeURIComponent(q)}',{target:'#search-results'})</script>` : ""}</div>
-
-<div class="channels-section" id="channel-list"${q ? ' style="display:none"' : ""}>
-  <h2>${visible.length} channel${visible.length === 1 ? "" : "s"}</h2>
-  ${chanCards || `<div class="empty">No channels yet.</div>`}
-</div>
-
+</main>
+${FOOTER_HTML}
 <script>
 document.addEventListener('htmx:afterSettle', () => {
   const q = document.querySelector('input[name="q"]')?.value?.trim();
-  const cl = document.getElementById('channel-list');
-  if (cl) cl.style.display = q ? 'none' : '';
+  const hl = document.getElementById('hero-links');
+  if (hl) hl.style.display = q ? 'none' : '';
 });
 document.querySelector('input[name="q"]')?.addEventListener('input', function() {
-  const cl = document.getElementById('channel-list');
-  if (cl) cl.style.display = this.value.trim() ? 'none' : '';
+  const hl = document.getElementById('hero-links');
+  if (hl) hl.style.display = this.value.trim() ? 'none' : '';
 });
 </script>
 </body>
@@ -242,8 +225,10 @@ export async function handleGlobalSearch(request: Request, url: URL, env: Env): 
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${q ? `${esc(q)} &middot; ` : ""}Search &middot; conda-wit</title>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
@@ -257,12 +242,13 @@ export async function handleGlobalSearch(request: Request, url: URL, env: Env): 
   <form method="GET" action="/search" class="controls" style="margin-bottom:20px">
     <label class="sr-only" for="global-search">Search all packages</label>
     <input id="global-search" type="search" name="q" placeholder="Search all packages&hellip;" value="${esc(q)}" autocomplete="off" autofocus style="flex:1 1 400px">
-    <button type="submit" style="padding:10px 20px;background:#2d7a1f;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Search</button>
+    <button type="submit" style="padding:10px 20px;background:#0B8275;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Search</button>
   </form>
   ${q ? `<div class="count">${rows.length} result${rows.length === 1 ? "" : "s"} for &ldquo;${esc(q)}&rdquo;</div>
   ${resultCards || `<div class="empty">No packages match &ldquo;${esc(q)}&rdquo; across any public channel.</div>`}` : `<div class="empty" style="padding-top:60px">Enter a package name to search across all public channels.</div>`}
 </div>
 </main>
+${FOOTER_HTML}
 </body>
 </html>`;
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
@@ -320,9 +306,11 @@ export async function handleChannelsIndex(request: Request, env: Env): Promise<R
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Browse all conda channels hosted on this server.">
 <title>Channels &middot; conda-wit</title>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
@@ -336,12 +324,13 @@ export async function handleChannelsIndex(request: Request, env: Env): Promise<R
   <form method="GET" action="/search" class="controls">
     <label class="sr-only" for="global-search">Search all packages</label>
     <input id="global-search" type="search" name="q" placeholder="Search packages across all channels&hellip;" autocomplete="off">
-    <button type="submit" style="padding:10px 20px;background:#2d7a1f;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Search</button>
+    <button type="submit" style="padding:10px 20px;background:#0B8275;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Search</button>
   </form>
   <div class="count">${visible.length} channel${visible.length === 1 ? "" : "s"}</div>
   ${cards.join("") || `<div class="empty">No channels yet.</div>`}
 </div>
 </main>
+${FOOTER_HTML}
 </body>
 </html>`;
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
@@ -373,9 +362,11 @@ export async function handleNamespacePage(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Channels owned by ${esc(namespace)}.">
 <title>${esc(namespace)} &middot; channels</title>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}</style>
 </head>
 <body>
@@ -391,6 +382,7 @@ export async function handleNamespacePage(
   ${cards.join("") || `<div class="empty">No channels in this namespace.</div>`}
 </div>
 </main>
+${FOOTER_HTML}
 </body>
 </html>`;
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
@@ -467,13 +459,15 @@ export async function handleBrowsePage(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Browse packages in the ${esc(channel)} conda channel. Search, filter, and install packages.">
 <title>${esc(channel)} &middot; packages</title>
 <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}
-  .header-user a.admin-btn { color: #52606d; text-decoration: none; font-size: 13px; }
-  .header-user a.admin-btn:hover { text-decoration: underline; }
+  .header-user a.admin-btn { color: #6B7280; text-decoration: none; font-size: 13px; font-weight: 600; }
+  .header-user a.admin-btn:hover { color: #0B8275; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -499,6 +493,7 @@ export async function handleBrowsePage(
   <div id="results">${results}</div>
 </div>
 </main>
+${FOOTER_HTML}
 </body>
 </html>`;
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
@@ -603,12 +598,14 @@ export async function handleBrowsePackage(
 <html lang="en">
 <head>
 <meta charset="utf-8">
+${FAVICON_TAGS}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="${esc(rec.summary || `${name} package in the ${channel} conda channel`)}">
 <title>${esc(name)} &middot; ${esc(channel)}</title>
+${GOOGLE_FONTS}
 <style>${BROWSE_CSS}${PKG_DETAIL_CSS}
-  .del-file-btn { background:#fff; color:#b42318; border:1px solid #f5c2bf; padding:3px 10px; border-radius:5px; font-size:12px; cursor:pointer; white-space:nowrap; }
-  .del-file-btn:hover { background:#fdecea; }
+  .del-file-btn { background:#fff; color:#b42318; border:1px solid #fca5a5; padding:3px 10px; border-radius:5px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  .del-file-btn:hover { background:#fef2f2; }
 </style>
 </head>
 <body>
@@ -670,6 +667,7 @@ document.addEventListener('click', async (e) => {
   }
 });
 </script>` : ""}
+${FOOTER_HTML}
 </body>
 </html>`;
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });

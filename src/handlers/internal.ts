@@ -61,7 +61,14 @@ export async function handleUpsertPackage(request: Request, env: Env): Promise<R
        summary    = excluded.summary,
        license    = excluded.license,
        home       = excluded.home,
-       subdirs    = excluded.subdirs,
+       subdirs    = (
+         SELECT json_group_array(DISTINCT value)
+         FROM (
+           SELECT value FROM json_each(packages.subdirs)
+           UNION
+           SELECT value FROM json_each(excluded.subdirs)
+         )
+       ),
        updated_at = excluded.updated_at`,
   )
     .bind(
@@ -77,6 +84,112 @@ export async function handleUpsertPackage(request: Request, env: Env): Promise<R
     .run();
 
   return new Response("ok", { status: 200 });
+}
+
+export async function handleUpsertPackageBulk(request: Request, env: Env): Promise<Response> {
+  // Batch version of handleUpsertPackage. Accepts { packages: UpsertPackageBody[] }.
+  // Uses a D1 batch() so all upserts are one round-trip instead of N.
+  if (!verifyInternalSecret(request, env)) {
+    return new Response("unauthorized", { status: 401 });
+  }
+
+  const { packages } = await request.json<{ packages: UpsertPackageBody[] }>();
+  if (!Array.isArray(packages) || packages.length === 0) {
+    return new Response("packages must be a non-empty array", { status: 400 });
+  }
+
+  const stmts = packages.flatMap((body) => {
+    const { channel, name, version, summary, license, home, subdirs } = body;
+    if (!channel || !name || !version) return [];
+    return [
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO channels (name, owner, visibility, created_at) VALUES (?, NULL, 'public', ?)`,
+      ).bind(channel, Date.now()),
+      env.DB.prepare(
+        `INSERT INTO packages (channel, name, version, summary, license, home, subdirs, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(channel, name) DO UPDATE SET
+           version    = excluded.version,
+           summary    = excluded.summary,
+           license    = excluded.license,
+           home       = excluded.home,
+           subdirs    = (
+             SELECT json_group_array(DISTINCT value)
+             FROM (
+               SELECT value FROM json_each(packages.subdirs)
+               UNION
+               SELECT value FROM json_each(excluded.subdirs)
+             )
+           ),
+           updated_at = excluded.updated_at`,
+      ).bind(
+        channel,
+        name,
+        version,
+        summary ?? null,
+        license ?? null,
+        home ?? null,
+        JSON.stringify(subdirs ?? []),
+        Date.now(),
+      ),
+    ];
+  });
+
+  if (stmts.length === 0) {
+    return new Response("no valid packages in request", { status: 400 });
+  }
+
+  await env.DB.batch(stmts);
+  return Response.json({ upserted: packages.length });
+}
+
+export async function handleRegisterChannel(request: Request, env: Env): Promise<Response> {
+  // Called by the container after rebuild-index to ensure the channel row exists in D1.
+  // Only needs the channel name — no package metadata required.
+  if (!verifyInternalSecret(request, env)) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  const { channel } = await request.json<{ channel: string }>();
+  if (!channel) {
+    return new Response("missing required field: channel", { status: 400 });
+  }
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO channels (name, owner, visibility, created_at) VALUES (?, NULL, 'public', ?)`,
+  )
+    .bind(channel, Date.now())
+    .run();
+  return new Response("ok", { status: 200 });
+}
+
+export async function handleRequeueStaging(request: Request, channel: string, env: Env): Promise<Response> {
+  // Re-enqueue all objects stuck in _incoming/ for a channel, bypassing upload auth.
+  // Superadmin only. Used to recover from stuck ChannelIngestQueue state.
+  if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
+  const denied = await requireSuperadmin(request, env);
+  if (denied) return denied;
+
+  const prefix = `${channel}/_incoming/`;
+  let cursor: string | undefined;
+  let enqueued = 0;
+
+  do {
+    const list = await env.CHANNEL_BUCKET.list({ prefix, cursor });
+    await Promise.all(list.objects.map(async (obj) => {
+      const filename = obj.key.slice(prefix.length);
+      if (!filename || filename.includes("/")) return;
+      const queueId = env.QUEUE.idFromName(channel);
+      const queue = env.QUEUE.get(queueId);
+      await queue.fetch("http://queue/enqueue", {
+        method: "POST",
+        body: JSON.stringify({ channel, filename, uploadedAt: Date.now(), uploadedBy: env.SUPERADMIN_LOGIN }),
+        headers: { "content-type": "application/json" },
+      });
+      enqueued++;
+    }));
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+
+  return Response.json({ channel, enqueued });
 }
 
 export async function handleReconcile(
