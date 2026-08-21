@@ -251,7 +251,7 @@ ${GOOGLE_FONTS}
   <form method="GET" action="/search" class="controls" style="margin-bottom:20px">
     <label class="sr-only" for="global-search">Search all packages</label>
     <input id="global-search" type="search" name="q" placeholder="Search all packages&hellip;" value="${esc(q)}" autocomplete="off" autofocus style="flex:1 1 400px">
-    <button type="submit" style="padding:10px 20px;background:#2d7a1f;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Search</button>
+    <button type="submit" style="padding:10px 20px;background:#0B8275;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Search</button>
   </form>
   ${q ? `<div class="count">${rows.length} result${rows.length === 1 ? "" : "s"} for &ldquo;${esc(q)}&rdquo;</div>
   ${resultCards || `<div class="empty">No packages match &ldquo;${esc(q)}&rdquo; across any public channel.</div>`}` : `<div class="empty" style="padding-top:60px">Enter a package name to search across all public channels.</div>`}
@@ -332,7 +332,7 @@ ${GOOGLE_FONTS}
   <form method="GET" action="/search" class="controls">
     <label class="sr-only" for="global-search">Search all packages</label>
     <input id="global-search" type="search" name="q" placeholder="Search packages across all channels&hellip;" autocomplete="off">
-    <button type="submit" style="padding:10px 20px;background:#2d7a1f;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Search</button>
+    <button type="submit" style="padding:10px 20px;background:#0B8275;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer">Search</button>
   </form>
   <div class="count">${visible.length} channel${visible.length === 1 ? "" : "s"}</div>
   ${cards.join("") || `<div class="empty">No channels yet.</div>`}
