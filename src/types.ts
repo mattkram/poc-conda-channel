@@ -36,6 +36,7 @@ export interface ChannelRow {
   name: string;
   owner: string | null;
   visibility: string;
+  require_oidc: number;
   created_at: number;
 }
 

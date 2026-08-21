@@ -36,7 +36,7 @@ export { SubdirIndexMerger } from "./do/subdir-index-merger.js";
 // Handler imports
 // ---------------------------------------------------------------------------
 import { startDeviceFlow, pollDeviceFlow, handleBrowserLoginStart, handleBrowserLoginCallback, handleBrowserLogout, resolveLogin } from "./handlers/auth.js";
-import { handleGetChannelInfo, handleSetVisibility, handleDeleteChannel } from "./handlers/channel.js";
+import { handleGetChannelInfo, handleSetVisibility, handleSetRequireOidc, handleDeleteChannel } from "./handlers/channel.js";
 import { handleUploadInit, handleUploadComplete } from "./handlers/upload.js";
 import { handleOidcExchange, handleListTrustedPublishers, handleAddTrustedPublisher, handleDeleteTrustedPublisher } from "./handlers/trusted-publishers.js";
 import { handleHomepage, handleSearchResults, handleGlobalSearch, handleChannelsIndex, handleNamespacePage, handleBrowseResults, handleBrowsePage, handleBrowsePackage, handleR2Get, handleChannelRoot, handleDeletePackage } from "./browse/pages.js";
@@ -103,6 +103,13 @@ export default {
     const repoRootMatch = p.match(/^\/repo\/([^/]+(?:\/[^/]+)?)\/?$/);
     if (repoRootMatch && m === "GET") return handleChannelRoot(request, repoRootMatch[1], env);
 
+    const tpMatch = p.match(/^\/channel\/([^/]+(?:\/[^/]+)?)\/trusted-publishers$/);
+    if (tpMatch && m === "GET") return handleListTrustedPublishers(request, tpMatch[1], env);
+    if (tpMatch && m === "POST") return handleAddTrustedPublisher(request, tpMatch[1], env);
+
+    const tpDelMatch = p.match(/^\/channel\/([^/]+(?:\/[^/]+)?)\/trusted-publishers\/(\d+)$/);
+    if (tpDelMatch && m === "DELETE") return handleDeleteTrustedPublisher(request, tpDelMatch[1], Number(tpDelMatch[2]), env);
+
     const pkgMatch = p.match(/^\/channel\/([^/]+(?:\/[^/]+)?)\/([^/]+)\/([^/]+)$/);
     if (pkgMatch && m === "DELETE") return handleDeletePackage(request, pkgMatch[1], pkgMatch[2], pkgMatch[3], env);
 
@@ -116,12 +123,8 @@ export default {
     const visMatch = p.match(/^\/channel\/([^/]+(?:\/[^/]+)?)\/visibility$/);
     if (visMatch && m === "POST") return handleSetVisibility(request, visMatch[1], env);
 
-    const tpMatch = p.match(/^\/channel\/([^/]+(?:\/[^/]+)?)\/trusted-publishers$/);
-    if (tpMatch && m === "GET") return handleListTrustedPublishers(request, tpMatch[1], env);
-    if (tpMatch && m === "POST") return handleAddTrustedPublisher(request, tpMatch[1], env);
-
-    const tpDelMatch = p.match(/^\/channel\/([^/]+(?:\/[^/]+)?)\/trusted-publishers\/(\d+)$/);
-    if (tpDelMatch && m === "DELETE") return handleDeleteTrustedPublisher(request, tpDelMatch[1], Number(tpDelMatch[2]), env);
+    const oidcMatch = p.match(/^\/channel\/([^/]+(?:\/[^/]+)?)\/require-oidc$/);
+    if (oidcMatch && m === "POST") return handleSetRequireOidc(request, oidcMatch[1], env);
 
     if (p === "/internal/upsert-package" && m === "POST") return handleUpsertPackage(request, env);
     if (p === "/internal/upsert-packages" && m === "POST") return handleUpsertPackageBulk(request, env);

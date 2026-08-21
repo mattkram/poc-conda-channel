@@ -159,6 +159,41 @@ export async function handleSetVisibility(
   return Response.json({ owner: row.owner, visibility });
 }
 
+export async function handleSetRequireOidc(
+  request: Request,
+  channel: string,
+  env: Env,
+): Promise<Response> {
+  if (!CHANNEL_NAME_RE.test(channel)) return new Response("invalid channel name", { status: 400 });
+
+  const login = await resolveLogin(request, env.UPLOAD_TOKEN_SECRET);
+  if (!login) return new Response("unauthorized", { status: 401 });
+
+  const row = await env.DB.prepare(`SELECT owner FROM channels WHERE name = ?`)
+    .bind(channel)
+    .first<{ owner: string | null }>();
+  if (!row) return new Response("channel not found", { status: 404 });
+  if (row.owner !== login) return new Response("only the channel owner can change this setting", { status: 403 });
+
+  const ct = request.headers.get("content-type") ?? "";
+  let require_oidc: number;
+  if (ct.includes("application/x-www-form-urlencoded") || ct.includes("multipart/form-data")) {
+    const fd = await request.formData();
+    require_oidc = fd.get("require_oidc") ? 1 : 0;
+  } else {
+    const body = await request.json<{ require_oidc?: boolean | number }>();
+    require_oidc = body.require_oidc ? 1 : 0;
+  }
+
+  await env.DB.prepare(`UPDATE channels SET require_oidc = ? WHERE name = ?`)
+    .bind(require_oidc, channel)
+    .run();
+
+  const isForm = ct.includes("application/x-www-form-urlencoded") || ct.includes("multipart/form-data");
+  if (isForm) return new Response(null, { status: 302, headers: { location: `/channels/${channel}/admin` } });
+  return Response.json({ require_oidc });
+}
+
 export async function handleDeleteChannel(
   request: Request,
   channel: string,
