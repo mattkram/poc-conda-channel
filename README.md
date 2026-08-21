@@ -13,48 +13,29 @@ path** — normal uploads never call it (see [Note on conda-index](#note-on-cond
 
 ```mermaid
 flowchart TD
-    Client([CLI / GitHub Actions])
-    GH([GitHub OAuth / JWKS])
-    R2[(R2 bucket)]
-    D1[(D1 SQLite)]
+    Client([Client])
+    Auth([Auth Provider\nGitHub OAuth / JWKS])
     Worker["Worker\n(auth · upload · browse UI)"]
-    CQ["ChannelQueue DO\n(debounce · owner state)"]
-    PI["PackageIngestor DO\n(fan-out relay)"]
-    CIQ["ChannelIngestQueue DO\n(serialized ingest)"]
-    SIM["SubdirIndexMerger DO\n(debounce · rebuild)"]
+    DOs["Durable Object Queues\n(ChannelQueue → PackageIngestor\n→ ChannelIngestQueue → SubdirIndexMerger)"]
     Container["Indexer Container\n(Python · port 8080)"]
+    R2[(R2)]
+    D1[(D1)]
 
-    Client -- "POST /auth/device/start\nPOST /auth/device/poll" --> Worker
-    Worker -- "device flow proxy" --> GH
-    Worker -- "mint HMAC token" --> Client
+    Client -- "auth flow" --> Worker
+    Worker -- "verify membership / JWKS" --> Auth
+    Worker -- "upload token" --> Client
 
-    Client -- "POST /upload/init" --> Worker
-    Worker -- "SigV4 presign" --> R2
-    Worker -- "presigned PUT URL" --> Client
+    Client -- "upload init/complete" --> Worker
     Client -- "PUT package bytes" --> R2
+    Worker -- "presign · confirm" --> R2
+    Worker -- "enqueue" --> DOs
 
-    Client -- "POST /upload/complete" --> Worker
-    Worker -- "HEAD (confirm landed)" --> R2
-    Worker -- "enqueue" --> CQ
+    DOs -- "ingest-package\nrebuild-index" --> Container
+    Container -- "read/write packages\nshards · repodata" --> R2
+    Container -- "upsert browse record" --> Worker
+    Worker -- "browse queries\nbrowse writes" --> D1
 
-    CQ -- "~5s alarm · fan-out" --> PI
-    PI -- "relay" --> CIQ
-    CIQ -- "one at a time" --> Container
-
-    Container -- "download staged pkg" --> R2
-    Container -- "write shard + final pkg" --> R2
-    Container -- "notify" --> SIM
-    Container -- "POST /internal/upsert-package" --> Worker
-    Worker -- "write browse record" --> D1
-
-    SIM -- "~3s alarm" --> Container
-    Container -- "read shards · write repodata.json\nrepodata_shards.msgpack.zst" --> R2
-
-    Client -- "GET /channels/… (browse UI)" --> Worker
-    Worker -- "query" --> D1
-
-    Client -- "GET /repo/:channel/:subdir/repodata.json" --> Worker
-    Worker -- "proxy" --> R2
+    Client -- "browse UI / repodata" --> Worker
 ```
 
 ## Source layout
