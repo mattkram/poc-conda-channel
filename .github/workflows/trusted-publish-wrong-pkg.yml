@@ -81,7 +81,7 @@ jobs:
           set -euo pipefail
           OIDC_TOKEN=$(curl -sSL \
             -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=conda-channel-server" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=conda-wit" \
             | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
 
           RESPONSE=$(curl -sSL -w "\n%{http_code}" -X POST "${CHANNEL_SERVER}/upload/exchange-oidc" \

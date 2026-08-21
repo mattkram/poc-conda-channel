@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-end test for conda-channel-server.
+End-to-end test for conda-wit.
 
 Flow:
   1. Auth (cached token or GitHub Device Flow)
@@ -23,7 +23,7 @@ POLL_TIMEOUT = 120
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="End-to-end test for conda-channel-server")
+    parser = argparse.ArgumentParser(description="End-to-end test for conda-wit")
     parser.add_argument("--channel", default="test", help="Channel to use (default: test)")
     parser.add_argument("--worker-url", default=DEFAULT_WORKER_URL, metavar="URL")
     parser.add_argument("--no-cleanup", action="store_true", help="Leave channel intact after test")

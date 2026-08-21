@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-conda-channel-manager — CLI for conda-channel-server.
+conda-channel-manager — CLI for conda-wit.
 
 Commands:
   login    Authenticate via GitHub Device Flow and cache the token.
@@ -35,7 +35,7 @@ POLL_TIMEOUT = 120
 def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="channel_manager.py",
-        description="Manage a conda-channel-server channel.",
+        description="Manage a conda-wit channel.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

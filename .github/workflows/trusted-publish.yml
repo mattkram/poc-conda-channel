@@ -102,10 +102,10 @@ jobs:
           set -euo pipefail
 
           # Request the OIDC JWT from GitHub's token endpoint.
-          # audience must match the value the Worker checks: conda-channel-server
+          # audience must match the value the Worker checks: conda-wit
           OIDC_TOKEN=$(curl -sSL \
             -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=conda-channel-server" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=conda-wit" \
             | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
 
           # Exchange OIDC token for a scoped upload token; print body on error

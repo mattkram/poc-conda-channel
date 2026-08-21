@@ -1,5 +1,5 @@
 {
-  "name": "conda-channel-server",
+  "name": "conda-wit",
   "private": true,
   "type": "module",
   "scripts": {
