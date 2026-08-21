@@ -128,8 +128,8 @@ ${GOOGLE_FONTS}
 
 <main>
 <div class="hero">
-  <img class="hero-logo" src="/logo.png" alt="conda-wit — Lightweight &amp; Channeling Your Packages" width="340" height="266" fetchpriority="high">
-  <p class="hero-tagline">Lightweight &amp; Channeling Your Packages</p>
+  <img class="hero-logo" src="/logo.png" alt="conda-wit — Ethereal Package Channeling" width="340" height="266" fetchpriority="high">
+  <p class="hero-tagline">Ethereal Package Channeling</p>
   <form class="hero-search-wrap"
         hx-get="/search/results"
         hx-trigger="input changed delay:300ms from:input[name='q'], submit"

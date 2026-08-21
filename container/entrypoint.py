@@ -717,12 +717,17 @@ class Handler(BaseHTTPRequestHandler):
             if not channel or not subdir:
                 self._respond(400, b"missing channel or subdir")
                 return
-            try:
-                result = rebuild_index_and_repodata(channel, subdir)
-                self._respond(200, json.dumps(result).encode())
-            except Exception as e:  # noqa: BLE001
-                log("rebuild.error", channel=channel, subdir=subdir, error=str(e))
-                self._respond(500, json.dumps({"error": str(e)}).encode())
+            # Run rebuild in a background thread so we can return 202 immediately.
+            # The Worker has a ~30s timeout on container fetches; conda-index takes
+            # longer than that on large subdirs, causing false 500s and retry loops.
+            import threading
+            def _run():
+                try:
+                    rebuild_index_and_repodata(channel, subdir)
+                except Exception as e:  # noqa: BLE001
+                    log("rebuild.error", channel=channel, subdir=subdir, error=str(e))
+            threading.Thread(target=_run, daemon=True).start()
+            self._respond(202, json.dumps({"status": "rebuilding"}).encode())
 
         elif self.path == "/rebuild-browse":
             channel = payload.get("channel")
