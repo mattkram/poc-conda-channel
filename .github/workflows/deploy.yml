@@ -29,7 +29,6 @@ jobs:
         run: |
           echo "${{ secrets.GH_CLIENT_ID }}"           | npx wrangler secret put GITHUB_CLIENT_ID
           echo "${{ secrets.GH_CLIENT_SECRET }}"       | npx wrangler secret put GITHUB_CLIENT_SECRET
-          echo "${{ secrets.GITHUB_ORG }}"             | npx wrangler secret put GITHUB_ORG
           echo "${{ secrets.UPLOAD_TOKEN_SECRET }}"    | npx wrangler secret put UPLOAD_TOKEN_SECRET
           echo "${{ secrets.INTERNAL_SECRET }}"        | npx wrangler secret put INTERNAL_SECRET
           echo "${{ secrets.R2_ACCESS_KEY_ID }}"       | npx wrangler secret put R2_ACCESS_KEY_ID

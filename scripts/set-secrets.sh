@@ -19,7 +19,6 @@ GH_ENV="production"
 SECRETS=(
   "GH_CLIENT_ID:GITHUB_CLIENT_ID"
   "GH_CLIENT_SECRET:GITHUB_CLIENT_SECRET"
-  "GITHUB_ORG:GITHUB_ORG"
   "UPLOAD_TOKEN_SECRET:UPLOAD_TOKEN_SECRET"
   "INTERNAL_SECRET:INTERNAL_SECRET"
   "R2_ACCESS_KEY_ID:R2_ACCESS_KEY_ID"
@@ -36,7 +35,7 @@ for entry in "${SECRETS[@]}"; do
   gh_name="${entry%%:*}"
   cf_name="${entry##*:}"
 
-  printf "Enter %s (input hidden): " "$cf_name"
+  printf "Enter %s (input hidden): " "$gh_name"
   read -rs value
   echo
   if [[ -z "$value" ]]; then
