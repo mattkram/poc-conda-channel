@@ -1,209 +1,311 @@
 # conda-channel-server
 
-Lightweight conda channel: R2 for storage, one Worker for auth/upload, one
-Cloudflare Container (running real `conda-index`) that wakes on upload and
-sleeps 2 min later. Accepts both `.conda` (current format) and legacy
-`.tar.bz2` packages — `conda_package_streaming` reads metadata from either
-uniformly, and `conda-index` indexes both into the same `repodata.json`.
+Lightweight conda channel server: R2 for storage, one Cloudflare Worker for auth, upload
+orchestration, and a browse UI; one Cloudflare Container running the indexer that wakes on
+upload and sleeps 2 min after going idle.
+
+Accepts both `.conda` (current format) and legacy `.tar.bz2` packages.
+`conda_package_streaming` extracts metadata from either uniformly.
+`conda-index` is present in the container image but is **only invoked on the deletion slow
+path** — normal uploads never call it (see [Note on conda-index](#note-on-conda-index)).
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Client([CLI / GitHub Actions])
+    GH([GitHub OAuth / JWKS])
+    R2[(R2 bucket)]
+    D1[(D1 SQLite)]
+    Worker["Worker\n(auth · upload · browse UI)"]
+    CQ["ChannelQueue DO\n(debounce · owner state)"]
+    PI["PackageIngestor DO\n(fan-out relay)"]
+    CIQ["ChannelIngestQueue DO\n(serialized ingest)"]
+    SIM["SubdirIndexMerger DO\n(debounce · rebuild)"]
+    Container["Indexer Container\n(Python · port 8080)"]
+
+    Client -- "POST /auth/device/start\nPOST /auth/device/poll" --> Worker
+    Worker -- "device flow proxy" --> GH
+    Worker -- "mint HMAC token" --> Client
+
+    Client -- "POST /upload/init" --> Worker
+    Worker -- "SigV4 presign" --> R2
+    Worker -- "presigned PUT URL" --> Client
+    Client -- "PUT package bytes" --> R2
+
+    Client -- "POST /upload/complete" --> Worker
+    Worker -- "HEAD (confirm landed)" --> R2
+    Worker -- "enqueue" --> CQ
+
+    CQ -- "~5s alarm · fan-out" --> PI
+    PI -- "relay" --> CIQ
+    CIQ -- "one at a time" --> Container
+
+    Container -- "download staged pkg" --> R2
+    Container -- "write shard + final pkg" --> R2
+    Container -- "notify" --> SIM
+    Container -- "POST /internal/upsert-package" --> Worker
+    Worker -- "write browse record" --> D1
+
+    SIM -- "~3s alarm" --> Container
+    Container -- "read shards · write repodata.json\nrepodata_shards.msgpack.zst" --> R2
+
+    Client -- "GET /channels/… (browse UI)" --> Worker
+    Worker -- "query" --> D1
+
+    Client -- "GET /repo/:channel/:subdir/repodata.json" --> Worker
+    Worker -- "proxy" --> R2
+```
+
+## Source layout
+
+```
+src/
+  worker.ts                   # entrypoint — URL router + DO exports
+  types.ts                    # shared Env + row interfaces
+  utils.ts                    # b64url, HMAC helpers
+  browse/
+    pages.ts                  # all full-page and HTMX-partial handlers
+    render.ts                 # package-list card rendering
+    ui.ts                     # CSS constants, FOOTER_HTML, FAVICON_TAGS
+  do/
+    channel-queue.ts          # ChannelQueue DO
+    channel-ingest-queue.ts   # ChannelIngestQueue DO
+    package-ingestor.ts       # PackageIngestor DO
+    subdir-index-merger.ts    # SubdirIndexMerger DO
+  handlers/
+    auth.ts                   # device flow, browser OAuth (PKCE), OIDC exchange
+    channel.ts                # channel CRUD, access control
+    upload.ts                 # presign + complete
+    internal.ts               # container callbacks, admin ops
+    trusted-publishers.ts     # OIDC trusted-publisher CRUD
+    admin.ts                  # admin page + rebuild-browse trigger
+
+container/
+  Dockerfile                  # debian:bookworm-slim + pixi
+  entrypoint.py               # Python HTTP server (port 8080)
+  pixi.toml                   # Python deps (conda-index, conda_package_streaming, boto3, …)
+```
 
 ## Setup
 
+### 1. Create the R2 bucket
+
 ```bash
-npm install
-wrangler secret put GITHUB_CLIENT_ID
-wrangler secret put GITHUB_ORG
-wrangler secret put UPLOAD_TOKEN_SECRET   # any random 32+ byte string
+wrangler r2 bucket create conda-channel
 ```
 
-The Worker needs R2 S3-compatible credentials too — not to move bytes,
-only to *sign* presigned URLs (aws4fetch does the SigV4 signing locally,
-no extra network call), and to forward into the container's environment
-(see below):
+Edit `R2_BUCKET_NAME` in `wrangler.toml` `[vars]` first if you want a different name.
+
+### 2. Create a D1 database
 
 ```bash
+wrangler d1 create conda-channel-meta
+```
+
+Paste the returned `database_id` into `wrangler.toml` under `[[d1_databases]]`.
+
+### 3. Create a GitHub OAuth App
+
+Go to **github.com → Settings → Developer settings → OAuth Apps → New OAuth App**.
+Enable **Device Flow** (checkbox in the app settings). You need:
+
+- `Client ID` — passed as `GITHUB_CLIENT_ID`
+- `Client Secret` — passed as `GITHUB_CLIENT_SECRET` (needed for the browser OAuth flow)
+
+### 4. Create an R2 API token
+
+**Cloudflare dashboard → R2 → Manage API Tokens → Create API Token** (read + write on the
+bucket above). This gives you S3-compatible credentials: Access Key ID, Secret Access Key,
+and your R2 Account ID.
+
+### 5. Set secrets
+
+```bash
+wrangler secret put GITHUB_CLIENT_ID       # OAuth App client ID
+wrangler secret put GITHUB_CLIENT_SECRET   # OAuth App client secret (browser login)
+wrangler secret put GITHUB_ORG             # GitHub org — upload access is gated on membership
+wrangler secret put UPLOAD_TOKEN_SECRET    # any random 32+ byte string: openssl rand -hex 32
+wrangler secret put INTERNAL_SECRET        # shared secret between Worker and container
 wrangler secret put R2_ACCESS_KEY_ID
 wrangler secret put R2_SECRET_ACCESS_KEY
 wrangler secret put R2_ACCOUNT_ID
 ```
 
-`R2_BUCKET_NAME` isn't sensitive, so it's a plain `[vars]` entry already in
-`wrangler.toml` rather than a secret — edit it there if your bucket name
-differs from `conda-channel`.
+`R2_BUCKET_NAME` is not sensitive and lives in `wrangler.toml [vars]`.
 
-**The container gets these same R2 credentials automatically** — not via
-any wrangler.toml container config block (there isn't one for this), but
-through `envVars` on the `IndexerContainer` class in `src/worker.ts`, which
-references the Worker's own `env` at the module level:
+**The container receives the R2 credentials and `INTERNAL_SECRET` automatically** — not via
+any `wrangler.toml` container config block, but through the `envVars` field on the
+`IndexerContainer` class in `src/worker.ts`, which reads from the Worker's own `env` at
+module load time:
 
 ```ts
 import { env } from "cloudflare:workers";
 
 export class IndexerContainer extends Container<Env> {
+  defaultPort = 8080;
+  sleepAfter = "2m";
   envVars = {
-    R2_ACCOUNT_ID: env.R2_ACCOUNT_ID,
-    R2_ACCESS_KEY_ID: env.R2_ACCESS_KEY_ID,
+    R2_ACCOUNT_ID:       env.R2_ACCOUNT_ID,
+    R2_ACCESS_KEY_ID:    env.R2_ACCESS_KEY_ID,
     R2_SECRET_ACCESS_KEY: env.R2_SECRET_ACCESS_KEY,
-    R2_BUCKET_NAME: env.R2_BUCKET_NAME,
+    R2_BUCKET_NAME:      env.R2_BUCKET_NAME,
+    WORKER_URL:          "https://conda.matt-kramer.com",
+    INTERNAL_SECRET:     env.INTERNAL_SECRET,
   };
 }
 ```
 
-Nothing further to provision for the container — the same four secrets
-above cover it.
-
-## Flow
-
-1. `POST /auth/device/start` -> user code + verification URL
-2. user approves in browser, CLI polls `POST /auth/device/poll`
-3. Worker checks GitHub org membership, mints a 1hr HMAC upload token
-4. `POST /upload/init` `{"channel": "main", "filename": "pkg-1.0-0.conda"}`
-   with `Authorization: Bearer <token>` -> Worker returns a presigned R2 PUT
-   URL, valid 15 min. **No package bytes touch the Worker at this step.**
-5. Client `PUT`s the package (`.conda` or legacy `.tar.bz2`) directly to that
-   URL — straight to R2.
-6. `POST /upload/complete` with the same `{channel, filename}` -> Worker
-   confirms the object landed (a cheap `head()`, not a read of the bytes),
-   then hands off to the `ChannelQueue` Durable Object for that channel and
-   returns `202 Accepted` — indexing happens asynchronously from here.
-7. `ChannelQueue` records the upload and, if no alarm is already set,
-   schedules one ~5s out. Any other uploads to the same channel in that
-   window join the same batch automatically.
-8. When the alarm fires, `ChannelQueue` forwards each pending upload to
-   `PackageIngestor` (one DO instance per file), which immediately enqueues
-   it onto `ChannelIngestQueue` (one instance per channel).
-9. `ChannelIngestQueue` drains its work items one at a time, calling the
-   container's `/ingest-package` for each file. The container downloads the
-   package, extracts its metadata using `conda_package_streaming` (the same
-   library conda-index uses internally), computes checksums, and writes a
-   per-package CEP-16 shard to R2. It does **not** call `conda-index` on the
-   hot path — metadata is extracted per-package incrementally, not by
-   scanning the whole subdir. After each successful ingest it notifies
-   `SubdirIndexMerger` for the affected subdir.
-10. `SubdirIndexMerger` (one instance per `channel/subdir`) debounces
-    `rebuild-index` calls with a ~3s window — so if five packages land in
-    `linux-64` within a few seconds, only one full rebuild runs, not five.
-    When the alarm fires it calls the container's `/rebuild-index`, which
-    reads all current per-package shards from R2, assembles them into a new
-    `repodata_shards.msgpack.zst` (CEP-16 shard index) and regenerates the
-    monolithic `repodata.json`. Again, no `conda-index` call — the rebuild
-    assembles `repodata.json` directly from the shards, which already contain
-    the complete per-file metadata.
-11. The container also writes `_browse/<name>.json` for each ingested package
-    and calls back to `POST /internal/upsert-package` on the Worker to keep
-    D1 in sync — this is what powers the browse UI and search.
-
-The only service that ever reads package bytes is the container (step 9),
-and it has to — that's what makes metadata extraction work.
-
-> **Note on conda-index:** `conda-index` is still present in the container
-> image and is invoked on the **slow path** only: `DELETE`ing a package
-> triggers a full `conda-index` reindex of the affected subdir (since
-> removing a file requires scanning what's left). Normal uploads never call
-> `conda-index` — we replicate what it produces (same `repodata.json` fields,
-> same CEP-16 shard format) by extracting metadata per-package with
-> `conda_package_streaming`. This means `patch_instructions.json` and
-> `current_repodata.json` are not generated on the hot path; for private/org
-> channels built from your own packages this is fine, but mirroring
-> conda-forge would require the full reindex path.
-
-### Durable Object roles
-
-Four DOs collaborate to make the ingest pipeline serialised, batched, and
-crash-safe:
-
-| DO | Instance key | Role |
-|---|---|---|
-| `ChannelQueue` | one per channel | Debounces uploads (~5s window), owns channel `owner`/`visibility` state, prevents concurrent ingest runs |
-| `PackageIngestor` | one per `channel/filename` | Thin relay — exists so `ChannelQueue.alarm()` can fan out to multiple files in parallel without coupling directly to `ChannelIngestQueue` |
-| `ChannelIngestQueue` | one per channel | Serialises per-file container calls (one at a time), handles retries with back-off |
-| `SubdirIndexMerger` | one per `channel/subdir` | Debounces `rebuild-index` calls (~3s), coalesces multiple near-simultaneous package ingests into a single conda-index run |
-
-`PackageIngestor` is the thinnest of the four — it's a one-`fetch()` relay
-that could in theory be inlined into `ChannelQueue`. It exists as a
-separate DO so that `ChannelQueue.alarm()` can `await` multiple ingest
-dispatches without coupling its state machine directly to
-`ChannelIngestQueue`'s API.
-
-The only service that ever reads package bytes is the container in step 8,
-and it has to — that's what makes conda-index work.
-
-### Atomicity, ordering, batching
-
-- **Atomicity**: a Durable Object never runs two alarm invocations
-  concurrently, and `ChannelQueue` is one instance per channel — so there is
-  never more than one `/ingest-batch` call (and therefore one `conda-index`
-  run) in flight for a given channel at a time. This is Cloudflare's own
-  concurrency guarantee, not a lock we built.
-- **Ordering**: pending uploads are stored under keys like
-  `pending:<zero-padded-timestamp>:<filename>`, so listing them back out is
-  already in upload order — no separate sort step.
-- **Batching**: the ~5s debounce window coalesces near-simultaneous uploads
-  into a single container wake + single conda-index run per affected subdir.
-- **Partial failure**: `repodata.json` is uploaded last, after the packages
-  it references are already durably in R2, and only after the packages,
-  cache, and repodata for a subdir are all confirmed uploaded does that
-  subdir's staged files get deleted — so a crash mid-batch never leaves
-  repodata pointing at a package that isn't there, and never loses an
-  upload (it just stays in `_incoming/` for the next retry).
-
-Bucket layout ends up as:
-
-```
-main/noarch/repodata.json
-main/noarch/repodata_shards.msgpack.zst    <- CEP-16 shard index
-main/noarch/shards/<sha256>.msgpack.zst    <- one per package, immutable
-main/noarch/.cache/cache.db                <- conda-index's own incremental cache, persisted
-main/noarch/some-pkg-1.0-0.conda
-main/linux-64/repodata.json
-main/linux-64/repodata_shards.msgpack.zst
-main/linux-64/shards/<sha256>.msgpack.zst
-main/linux-64/.cache/cache.db
-main/linux-64/some-pkg-1.0-0.conda
-experimental/osx-arm64/repodata.json
-...
-```
-
-Point conda at a specific channel with the custom domain + path, e.g.
-`conda install -c https://channel.example.com/main some-pkg`.
-
-## Deploy
+### 6. Install dependencies and deploy
 
 ```bash
-wrangler deploy
+npm install
+wrangler deploy   # also builds and pushes the container image — Docker must be running
 ```
 
-## Not yet handled (fine for v1, revisit later)
+For local iteration, copy `.dev.vars.example` to `.dev.vars` and fill in real values.
+`.dev.vars` is gitignored; never commit real values.
 
-- **conda-index's own sqlite cache (`<subdir>/.cache/cache.db`) is persisted
-  in R2** alongside packages and repodata, downloaded before indexing and
-  re-uploaded after. Without this, conda-index has no memory between
-  container invocations and re-extracts every package's metadata on every
-  single upload — the cache is what makes its incremental indexing actually
-  incremental for us. Note this only saves extraction *CPU*, not download
-  time: every package's bytes still get pulled from R2 each run since
-  conda-index expects the files present locally. If a channel grows large
-  enough that download time dominates, the next optimization is skipping
-  downloads for files whose R2 ETag/size match a previous run, rather than
-  redownloading the whole subdir every time.
-- `ChannelQueue` guarantees serialization *per channel*, not globally — many
-  different channels can still reindex concurrently (that's fine, they're
-  independent), but a container has a real memory/CPU ceiling
-  (`instance_type` in wrangler.toml), so if you have dozens of very active
-  channels at once, `max_instances` on `[[containers]]` becomes the actual
-  throughput limit, not this queue.
-- Upload returns `202 Accepted`, not a final "reindexed" confirmation —
-  indexing is asynchronous (debounced + batched). There's currently no
-  status-check endpoint for the client to poll; if you want one, a simple
-  `GET /channel/<channel>/status` that reads `ChannelQueue`'s pending count
-  would do it.
-- No package deletion/yanking UI — owners can delete individual files from
-  the package detail page (`DELETE /channel/:channel/:subdir/:filename`),
-  which triggers a reindex of the affected subdir. Bulk deletion and yanking
-  (keeping the file but flagging it) are not yet implemented.
-- If ingest fails partway (e.g. `index.json` is malformed), the file is left
-  under `<channel>/_incoming/` rather than silently lost — but nothing
-  currently sweeps that directory, so add a periodic cleanup if failed
-  uploads pile up (distinct from the retry queue — this is for uploads that
-  fail validation entirely, e.g. corrupt files, which retries can't fix).
-- No signature/hash verification beyond what `conda-index` already embeds in
-  repodata.
+## Upload flow (step by step)
+
+```
+Client                         Worker                    R2          DOs              Container
+  │                              │                        │            │                  │
+  │─ POST /auth/device/start ───►│                        │            │                  │
+  │◄── {user_code, verify_url} ──│  (proxies GitHub)      │            │                  │
+  │  [user approves in browser]  │                        │            │                  │
+  │─ POST /auth/device/poll ────►│                        │            │                  │
+  │◄── {upload_token} (HMAC) ───│  (1 hr TTL)            │            │                  │
+  │                              │                        │            │                  │
+  │─ POST /upload/init ─────────►│                        │            │                  │
+  │                              │── SigV4 presign ──────►│            │                  │
+  │◄── {upload_url} ────────────│  (15 min, no bytes)    │            │                  │
+  │                              │                        │            │                  │
+  │─ PUT <bytes> ───────────────────────────────────────►│            │                  │
+  │                              │                        │            │                  │
+  │─ POST /upload/complete ─────►│                        │            │                  │
+  │                              │── HEAD (confirm) ─────►│            │                  │
+  │                              │── enqueue ─────────────────────────►│ ChannelQueue     │
+  │◄── 202 Accepted ────────────│                        │            │  (~5s alarm)      │
+  │                              │                        │            │                  │
+  │                              │                        │    alarm fires               │
+  │                              │                        │    fan-out ──────────────────►│ PackageIngestor
+  │                              │                        │            │◄── relay ────────►│ ChannelIngestQueue
+  │                              │                        │            │  (one at a time)  │
+  │                              │                        │            │─ /ingest-package ►│
+  │                              │                        │◄────────── download staged ───│
+  │                              │                        │◄────────── write shard+pkg ───│
+  │                              │◄─ POST /internal/upsert-package ──────────────────────│
+  │                              │── write D1 ───────────────────────►│                  │
+  │                              │                        │            │◄── notify SIM ───│
+  │                              │                        │            │  (~3s alarm)      │
+  │                              │                        │            │─ /rebuild-index ─►│
+  │                              │                        │◄────────── read shards ───────│
+  │                              │                        │◄────────── write repodata ────│
+```
+
+### Auth alternatives
+
+| Method | When to use | Endpoint |
+|---|---|---|
+| **Device flow** | CLI / headless | `POST /auth/device/start` + `POST /auth/device/poll` |
+| **Browser OAuth** | Web UI login | `GET /auth/login` → GitHub callback → session cookie |
+| **GitHub Actions OIDC** | CI pipelines — no stored secrets | `POST /upload/exchange-oidc` |
+
+OIDC tokens are validated against GitHub's public JWKS (RS256) and matched against
+per-channel trusted-publisher rules stored in D1. A matched OIDC exchange mints a
+scoped 15-minute upload token. Manage trusted publishers via the channel admin page
+(`/channels/<owner>/<channel>/admin`) or the REST API.
+
+## Durable Object roles
+
+Five DOs collaborate to make the ingest pipeline serialised, batched, and crash-safe:
+
+| DO | Binding | Instance key | Role |
+|---|---|---|---|
+| `IndexerContainer` | `INDEXER` | `{channel}`, `{channel}/{subdir}/_merge`, `{channel}/_rebuild-browse` | Cloudflare Containers wrapper — the actual Python process |
+| `ChannelQueue` | `QUEUE` | one per channel | Debounces uploads (~5s window), owns `owner`/`visibility` state, handles channel claim |
+| `PackageIngestor` | `INGESTOR` | `{channel}/{filename}` | Thin fan-out relay — lets `ChannelQueue` await multiple dispatches in parallel without coupling to `ChannelIngestQueue` |
+| `ChannelIngestQueue` | `INGEST_QUEUE` | one per channel | Serialises container `/ingest-package` calls (one at a time), retries with back-off on failure |
+| `SubdirIndexMerger` | `MERGER` | `{channel}/{subdir}` | Debounces `rebuild-index` calls (~3s), coalesces concurrent package ingests into a single rebuild |
+
+## Container endpoints
+
+The container (`entrypoint.py`) is a plain Python `http.server.HTTPServer` on port 8080.
+All endpoints accept and return JSON.
+
+| Endpoint | Caller | Description |
+|---|---|---|
+| `POST /ingest-package` | `ChannelIngestQueue` alarm | **Hot path.** Download staged package → extract metadata via `conda_package_streaming` → read-modify-write CEP-16 shard in R2 → move to final location → delete staging → call back to Worker D1. Returns `{filename, name, subdir, new_hash, old_hash}`. |
+| `POST /rebuild-index` | `SubdirIndexMerger` alarm | Reads all `_shardptr/<name>` pointers → assembles `repodata_shards.msgpack.zst` (CEP-16) + `repodata.json` from existing shards. **No package downloads, no conda-index.** Returns `202` immediately; runs in a background thread to avoid Worker fetch timeouts on large subdirs. |
+| `POST /rebuild-browse` | Admin / reconcile | Scans all `repodata.json` files across subdirs → writes per-name `_browse/<name>.json` → rebuilds the browse index. Used for backfill/reconciliation. |
+| `POST /extract-metadata` | Internal | Download package → extract metadata → return repodata entry dict. Does **not** write anything. |
+| `POST /reindex` | Deletion slow path | Download all packages + cache.db → run `conda-index` subprocess → upload results. Called after `DELETE /channel/:channel/:subdir/:filename`. |
+
+## Atomicity, ordering, batching
+
+- **Atomicity**: a Durable Object never runs two alarm invocations concurrently, and
+  `ChannelQueue` is one instance per channel — so there is never more than one ingest
+  pipeline active for a given channel at a time. This is Cloudflare's own concurrency
+  guarantee, not a lock we built.
+- **Ordering**: pending uploads are stored under keys like
+  `pending:<zero-padded-timestamp>:<filename>`, so they are already in upload order when
+  listed back — no separate sort step.
+- **Batching**: the ~5s debounce in `ChannelQueue` coalesces near-simultaneous uploads
+  into a single container wake per channel.
+- **Partial failure**: `repodata.json` is written last, after all package shards it
+  references are durably in R2. A crash mid-rebuild leaves the previous valid
+  `repodata.json` in place — the shard-based layout means no package is ever referenced
+  before its shard exists.
+
+## R2 bucket layout
+
+```
+{channel}/{subdir}/repodata.json
+{channel}/{subdir}/repodata_shards.msgpack.zst   ← CEP-16 shard index
+{channel}/{subdir}/shards/<sha256>.msgpack.zst   ← one per package name, content-addressed
+{channel}/{subdir}/_shardptr/<name>              ← mutable pointer → current shard hash
+{channel}/{subdir}/_browse/<name>.json           ← browse UI metadata per package
+{channel}/{subdir}/<pkg>.conda
+{channel}/{subdir}/<pkg>.tar.bz2
+{channel}/{subdir}/.cache/cache.db               ← conda-index cache (deletion path only)
+{channel}/_incoming/<filename>                   ← staging area (deleted after ingest)
+```
+
+Point conda at a channel with e.g.:
+```bash
+conda install -c https://conda.matt-kramer.com/repo/main some-pkg
+```
+
+## Note on conda-index
+
+`conda-index` is present in the container image but is only invoked on the **slow path**:
+deleting a package triggers a full `conda-index` reindex of the affected subdir (since
+removing a file requires re-scanning what remains). Normal uploads never call `conda-index`
+— instead, `conda_package_streaming` extracts metadata per-package incrementally and the
+container assembles the same `repodata.json` fields and CEP-16 shard format that
+`conda-index` would produce.
+
+Consequence: `patch_instructions.json` and `current_repodata.json` are **not** generated on
+the hot path. For private/org channels built from your own packages this is fine; mirroring
+conda-forge would require the full reindex path.
+
+## Known gaps / future work
+
+- **No status endpoint**: `POST /upload/complete` returns `202` immediately; indexing is
+  async. A `GET /channel/:channel/status` returning `ChannelQueue`'s pending count would
+  close this gap.
+- **Trusted-publisher OIDC is the recommended CI path**, but normal upload tokens work for
+  all clients. If a channel has at least one trusted-publisher rule with `require_trusted=1`,
+  normal tokens are rejected for that channel.
+- **No bulk deletion or yanking UI** — owners can delete individual files from the package
+  detail page; bulk and yank-without-delete are not yet implemented.
+- **Failed-ingest files accumulate in `_incoming/`** — files that fail validation (e.g.
+  corrupt packages) are not retried and not cleaned up automatically; add a periodic sweep
+  if needed.
+- **`max_instances` on `[[containers]]`** (currently 10, `instance_type = "basic"`) is the
+  real throughput ceiling for concurrent active channels, not the per-channel DO queue.
+- **No signature/hash verification** beyond what `conda_package_streaming` provides when
+  extracting metadata.
+- **Cloudflare Containers is fast-moving** — `instance_type` values and plan requirements
+  may drift; check current docs before deploying on a new account.
