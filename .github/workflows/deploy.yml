@@ -25,6 +25,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Sync secrets to Cloudflare
+        run: |
+          echo "${{ secrets.GH_CLIENT_ID }}"           | npx wrangler secret put GITHUB_CLIENT_ID
+          echo "${{ secrets.GH_CLIENT_SECRET }}"       | npx wrangler secret put GITHUB_CLIENT_SECRET
+          echo "${{ secrets.UPLOAD_TOKEN_SECRET }}"    | npx wrangler secret put UPLOAD_TOKEN_SECRET
+          echo "${{ secrets.INTERNAL_SECRET }}"        | npx wrangler secret put INTERNAL_SECRET
+          echo "${{ secrets.R2_ACCESS_KEY_ID }}"       | npx wrangler secret put R2_ACCESS_KEY_ID
+          echo "${{ secrets.R2_SECRET_ACCESS_KEY }}"   | npx wrangler secret put R2_SECRET_ACCESS_KEY
+          echo "${{ secrets.R2_ACCOUNT_ID }}"          | npx wrangler secret put R2_ACCOUNT_ID
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       - name: Deploy
         run: npx wrangler deploy
         env:
